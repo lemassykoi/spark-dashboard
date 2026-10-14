@@ -21,35 +21,39 @@ export function EngineSpecDecodePanel({ panel }: PanelContentProps) {
 
   const { metric } = resolution
   const draftTokens = metric('spec_decode_draft_tokens_total')
+  const acceptanceRate = metric('spec_decode_acceptance_rate')
+  const meanAcceptanceLength = metric('spec_decode_mean_acceptance_length')
 
-  // The counter is present whenever speculative decoding is configured, and
-  // sits at zero on an engine that has not drafted anything yet. Gating on a
-  // drafted token keeps the panel from showing an all-dashes section that
-  // looks like a fault.
+  // Speculative decoding configured: any of the fields speaks for it. vLLM
+  // answers with the lifetime counters; SGLang reports only the acceptance
+  // gauges and never the counters — gating on the counter alone would tell a
+  // drafter-running SGLang engine it was "not using speculative decoding".
+  // (Both engines report nothing at all when no drafter is configured, so the
+  // negatives below stay honest.)
   //
   // The engine is named on a multi-engine host for the same reason its data
   // would be: with two engines on a page, "this engine" does not say which.
-  if (draftTokens === null || draftTokens === 0) {
-    // Under the aggregate the counters are combined, so their absence speaks
-    // for every model at once and "this engine" would name nothing.
+  if (draftTokens === null && acceptanceRate === null && meanAcceptanceLength === null) {
+    // Under the aggregate the absence speaks for every model at once, so
+    // naming one would be wrong.
     if (resolution.status === 'aggregate') {
-      return (
-        <PanelNotice>
-          {draftTokens === null
-            ? 'No model is using speculative decoding.'
-            : 'No model has drafted a token yet.'}
-        </PanelNotice>
-      )
+      return <PanelNotice>No model is using speculative decoding.</PanelNotice>
     }
-
     const subject = engineLabel(resolution) ?? 'This engine'
-    return (
-      <PanelNotice>
-        {draftTokens === null
-          ? `${subject} is not using speculative decoding.`
-          : `${subject} has drafted no tokens yet.`}
-      </PanelNotice>
-    )
+    return <PanelNotice>{`${subject} is not using speculative decoding.`}</PanelNotice>
+  }
+
+  // Configured and idle: vLLM's counter arrives at zero before the first
+  // draft, and its absence from SGLang's gauges means the same while nothing
+  // has been drafted — in both shapes the drafter exists and the wait is the
+  // truth, so the panel says "not yet" rather than showing an all-dashes
+  // section that looks like a fault.
+  if ((draftTokens === 0 || draftTokens === null) && acceptanceRate === null) {
+    if (resolution.status === 'aggregate') {
+      return <PanelNotice>No model has drafted a token yet.</PanelNotice>
+    }
+    const subject = engineLabel(resolution) ?? 'This engine'
+    return <PanelNotice>{`${subject} has drafted no tokens yet.`}</PanelNotice>
   }
 
   return (

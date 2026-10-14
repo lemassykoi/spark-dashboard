@@ -167,8 +167,19 @@ export function formatGpuIndexes(indexes: number[]): string {
 export function engineDisplayName(engineType: EngineType): string {
   const names: Record<EngineType, string> = {
     Vllm: 'vLLM',
+    Sglang: 'SGLang',
   }
   return names[engineType]
+}
+
+/** The engine type's icon, beside its name in the status chip. Every engine
+ *  type in the union must have one — the record is exhaustive by typing. */
+export function engineIconPath(engineType: EngineType): string {
+  const icons: Record<EngineType, string> = {
+    Vllm: '/icons/vllm.svg',
+    Sglang: '/icons/sglang.svg',
+  }
+  return icons[engineType]
 }
 
 /**
@@ -257,6 +268,16 @@ export function coverageNote(coverage: GroupCoverage): string | null {
     .join(', ')
   // A caption stands alone, so it starts as a sentence: "Throughput 3 of 3, …".
   return `${perGroup.charAt(0).toUpperCase()}${perGroup.slice(1)} engines`
+}
+
+/**
+ * What a panel says when the engine runs with its metrics endpoint switched
+ * off by a launch flag: not "does not report" (the metrics exist — the engine
+ * was just started without the flag that publishes them) and not "not yet"
+ * (no traffic will fix it). Names the flag so the fix is copy-pasteable.
+ */
+export function metricsOffMessage(engine: EngineIdentity, flag: string): string {
+  return `${engineDescription(engine)} is running with metrics off — relaunch it with ${flag}.`
 }
 
 /** "a", "a or b", "a, b or c" — the list a negated verb ranges over. */

@@ -1,6 +1,7 @@
 pub mod detector;
 pub mod histogram;
 pub mod prometheus;
+pub mod sglang;
 pub mod vllm;
 pub mod warmup;
 
@@ -17,6 +18,7 @@ use tokio::sync::RwLock;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum EngineType {
     Vllm,
+    Sglang,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
@@ -29,6 +31,7 @@ impl std::fmt::Display for EngineType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EngineType::Vllm => write!(f, "vLLM"),
+            EngineType::Sglang => write!(f, "SGLang"),
         }
     }
 }
@@ -293,6 +296,14 @@ pub struct EngineSnapshot {
     /// field (the frontend reads that as "every group", which is what such a
     /// backend reported).
     pub metric_groups: BTreeSet<MetricGroup>,
+    /// The engine runs and can report metrics, but was started without the
+    /// launch flag that turns its metrics endpoint on; the value is that
+    /// flag, named so the UI can tell the operator what to add. Distinct
+    /// from an empty `metric_groups` ("this engine does not report these
+    /// metrics at all"): here the metrics exist and are switched off.
+    /// `None` when metrics are on or the engine type has no metrics toggle
+    /// (the common case — most engines always expose `/metrics`).
+    pub metrics_off: Option<String>,
     pub metrics: Option<EngineMetrics>,
     pub recent_requests: Vec<RecentRequest>,
     pub deployment_mode: DeploymentMode,
@@ -330,6 +341,22 @@ pub trait EngineAdapter: Send + Sync {
     /// scrape. A group listed here whose fields are momentarily `None` is
     /// "not yet"; a group left out is "not reported", and its panels say so.
     fn metric_groups(&self) -> BTreeSet<MetricGroup>;
+    /// When the engine is running but its metrics endpoint is switched off by
+    /// a launch flag, the name of that flag — so the UI can say "metrics are
+    /// off; relaunch with `--enable-metrics`" instead of the vaguer "not
+    /// reported". `None` (the default) means metrics are on, or the engine
+    /// type has no metrics toggle at all. An engine type that grows this
+    /// signal overrides the flag name; the collector loop and wire format
+    /// need no change.
+    fn metrics_launch_flag(&self) -> Option<&'static str> {
+        None
+    }
+    /// Whether this instance is currently observed with its metrics endpoint
+    /// off — see `metrics_launch_flag`. Read on every snapshot assembly; the
+    /// adapter answers from its last scrape, without making a request.
+    fn metrics_off(&self) -> bool {
+        false
+    }
     async fn health_check(&self) -> EngineStatus;
     async fn get_model_info(&self) -> ModelResolution;
     async fn get_metrics(&self) -> Option<EngineMetrics>;
@@ -475,6 +502,17 @@ impl EngineState {
         model: Option<ModelInfo>,
         metrics: Option<EngineMetrics>,
     ) -> EngineSnapshot {
+        // The flag travels only while the engine is observed *running* with
+        // metrics off: an engine that has since gone down must report as
+        // offline, not as "running with metrics off" on the strength of a
+        // latch from its last live scrape. Both parts come from the same
+        // adapter state, so they cannot disagree.
+        let metrics_off = match &status {
+            EngineStatus::Running if self.adapter.metrics_off() => {
+                self.adapter.metrics_launch_flag().map(str::to_string)
+            }
+            _ => None,
+        };
         EngineSnapshot {
             engine_type: self.adapter.engine_type(),
             endpoint: self.adapter.endpoint().to_string(),
@@ -482,6 +520,7 @@ impl EngineState {
             model,
             model_metadata_error: self.model_metadata_error,
             metric_groups: self.adapter.metric_groups(),
+            metrics_off,
             metrics,
             recent_requests: Vec::new(),
             deployment_mode: self.deployment_mode.clone(),
@@ -595,6 +634,9 @@ pub fn create_adapter(
 ) -> Box<dyn EngineAdapter> {
     match engine_type {
         EngineType::Vllm => Box::new(vllm::VllmAdapter::new(
+            client, endpoint, model_hint, api_key,
+        )),
+        EngineType::Sglang => Box::new(sglang::SglangAdapter::new(
             client, endpoint, model_hint, api_key,
         )),
     }
@@ -793,6 +835,11 @@ mod tests {
     /// exercised — the cache logic under test is pure.
     struct StubAdapter {
         groups: BTreeSet<MetricGroup>,
+        /// Whether the adapter reports its metrics endpoint as switched off,
+        /// and the flag that would switch it on (`None` = a type without a
+        /// toggle, the trait default's shape).
+        metrics_off: bool,
+        flag: Option<&'static str>,
     }
 
     #[async_trait]
@@ -815,6 +862,12 @@ mod tests {
         async fn get_metrics(&self) -> Option<EngineMetrics> {
             None
         }
+        fn metrics_launch_flag(&self) -> Option<&'static str> {
+            self.flag
+        }
+        fn metrics_off(&self) -> bool {
+            self.metrics_off
+        }
     }
 
     fn state() -> EngineState {
@@ -823,7 +876,27 @@ mod tests {
 
     /// An engine whose adapter declares exactly `groups`.
     fn state_reporting(groups: BTreeSet<MetricGroup>) -> EngineState {
-        EngineState::new(Box::new(StubAdapter { groups }), DeploymentMode::Native)
+        EngineState::new(
+            Box::new(StubAdapter {
+                groups,
+                metrics_off: false,
+                flag: None,
+            }),
+            DeploymentMode::Native,
+        )
+    }
+
+    /// An adapter reporting metrics off behind a named flag, like SGLang
+    /// without `--enable-metrics`.
+    fn state_metrics_off() -> EngineState {
+        EngineState::new(
+            Box::new(StubAdapter {
+                groups: MetricGroup::all(),
+                metrics_off: true,
+                flag: Some("--enable-metrics"),
+            }),
+            DeploymentMode::Native,
+        )
     }
 
     fn model(name: &str) -> ModelInfo {
@@ -1124,6 +1197,32 @@ mod tests {
             json["metric_groups"],
             serde_json::json!(["Throughput", "LatencyMeans"])
         );
+    }
+
+    #[test]
+    fn a_running_engine_with_metrics_off_carries_the_flag_until_it_stops_running() {
+        // The distinct wire state travels through the real snapshot path,
+        // naming the flag — the same shape #137 gave `metric_groups`, so a
+        // future adapter with a different toggle only supplies its own flag.
+        let json =
+            serde_json_value(&state_metrics_off().snapshot(EngineStatus::Running, None, None));
+        assert_eq!(json["metrics_off"], serde_json::json!("--enable-metrics"));
+
+        // …and the flag does not outlive the engine: once the health check
+        // stops succeeding, a down engine reports offline, never "running
+        // with metrics off" from a latch of its last live scrape.
+        for status in [EngineStatus::Stopped, EngineStatus::Loading] {
+            let json = serde_json_value(&state_metrics_off().snapshot(status, None, None));
+            assert_eq!(json["metrics_off"], serde_json::Value::Null);
+        }
+
+        // An engine whose metrics are on never carries the field at all.
+        let json = serde_json_value(&state().snapshot(EngineStatus::Running, None, None));
+        assert_eq!(json["metrics_off"], serde_json::Value::Null);
+    }
+
+    fn serde_json_value(snapshot: &EngineSnapshot) -> serde_json::Value {
+        serde_json::to_value(snapshot).unwrap()
     }
 
     #[test]

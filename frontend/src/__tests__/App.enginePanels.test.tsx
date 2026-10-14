@@ -1320,3 +1320,118 @@ describe('the inference-request timeline', () => {
     ).toBeInTheDocument()
   })
 })
+
+describe('an engine running with its metrics endpoint off', () => {
+  it('names the launch flag instead of calling the engine silent, and still shows what the engine is', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'latency', type: 'engine-latency', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+        { id: 'who', type: 'engine-status', geometry: { x: 6, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(
+      makeSnapshot(1000, [
+        makeEngine(ALPHA, {
+          engine_type: 'Sglang',
+          metrics: null,
+          metrics_off: '--enable-metrics',
+        }),
+      ]),
+    )
+
+    // The distinct wire state: not "does not report" (the engine could — it
+    // was launched without the flag), not "not yet" (no traffic fixes it).
+    expect(
+      within(region('Latency')).getByText(
+        'SGLang localhost:8000 is running with metrics off — relaunch it with --enable-metrics.',
+      ),
+    ).toBeInTheDocument()
+
+    // Identity and liveness are not metrics: the status panel says exactly
+    // what is running, and on which port, while the metric panels wait.
+    expect(within(region('Engine')).getByText('SGLang')).toBeInTheDocument()
+    expect(within(region('Engine')).getByText('Qwen3-8B')).toBeInTheDocument()
+  })
+
+  it('leaves an engine without the wire field untouched — absent means metrics are on', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'latency', type: 'engine-latency', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    const engine = makeEngine(ALPHA, { engine_type: 'Sglang' })
+    expect(engine.metrics_off).toBeUndefined()
+    receive(makeSnapshot(1000, [engine]))
+
+    expect(within(region('Latency')).queryByText(/metrics off/)).not.toBeInTheDocument()
+  })
+})
+
+describe('speculative decoding on an engine that reports gauges instead of counters', () => {
+  it('shows the acceptance figures an SGLang drafter reports — no counters exist there', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'spec', type: 'engine-spec-decode', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(
+      makeSnapshot(1000, [
+        makeEngine(ALPHA, {
+          engine_type: 'Sglang',
+          metrics: engineMetrics({
+            spec_decode_draft_tokens_total: null,
+            spec_decode_accepted_tokens_total: null,
+            spec_decode_drafts_total: null,
+            spec_decode_acceptance_rate: 60,
+            spec_decode_mean_acceptance_length: 2.8,
+          }),
+        }),
+      ]),
+    )
+
+    const panel = region('Speculative Decoding')
+    expect(within(panel).queryByText('SGLang localhost:8000 is not using speculative decoding.')).not.toBeInTheDocument()
+    expect(within(panel).getByText('60')).toBeInTheDocument()
+    expect(within(panel).getByText('2.80')).toBeInTheDocument()
+  })
+
+  it('keeps a zero vLLM counter reading as "not yet", never as "not configured"', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'spec', type: 'engine-spec-decode', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(
+      makeSnapshot(1000, [
+        makeEngine(
+          ALPHA,
+          {},
+          {
+            spec_decode_draft_tokens_total: 0,
+            spec_decode_accepted_tokens_total: 0,
+            spec_decode_drafts_total: 0,
+            spec_decode_acceptance_rate: null,
+            spec_decode_acceptance_rate_live: null,
+            spec_decode_mean_acceptance_length: null,
+          },
+        ),
+      ]),
+    )
+
+    expect(
+      within(region('Speculative Decoding')).getByText('This engine has drafted no tokens yet.'),
+    ).toBeInTheDocument()
+  })
+})

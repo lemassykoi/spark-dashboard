@@ -93,6 +93,13 @@ export type EnginePanelResolution =
    * nothing to combine, and the panel says so rather than showing a zero.
    */
   | { status: 'not-reported-by-any'; groups: readonly MetricGroup[] }
+  /**
+   * The engine resolved and is serving, but runs with its metrics endpoint
+   * switched off by a launch flag. Not the state above — the engine *would*
+   * report these groups, they are merely unswitched-on — so the panel names
+   * the flag instead of calling the engine silent (ADR-0004).
+   */
+  | { status: 'metrics-off'; engine: EngineSnapshot; flag: string }
   /** The engine resolved, and has no metrics yet — starting, or loading a model. */
   | { status: 'starting'; engine: EngineSnapshot }
   /** The engine resolved and is not serving; `detail` says why. */
@@ -217,6 +224,16 @@ export function useEnginePanel(panel: DashboardPanel): EnginePanelResolution {
     if (target.status !== 'resolved') return target
 
     const { engine } = target
+    // Asked before any other engine state: "has no metrics yet" would promise
+    // data that is coming, and "does not report" would blame the engine —
+    // while the truth is a launch flag the operator can act on today. A
+    // starting engine is not at risk of the wrong message: the flag is only
+    // latched by a `/metrics` answer, and a server that is not up yet refuses
+    // the connection instead of answering it.
+    if (engine.metrics_off) {
+      return { status: 'metrics-off', engine, flag: engine.metrics_off }
+    }
+
     const reported = reportedMetricGroups(engine)
     // Asked before whether the engine is serving: "does not report" is true in
     // every state the engine can be in, while "is not running" or "has no

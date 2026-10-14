@@ -113,7 +113,7 @@ struct RunArgs {
     #[arg(long, env = "SPARK_DASHBOARD_SIMULATE_GPUS", default_value_t = 0)]
     simulate_gpus: u32,
 
-    /// Manually specify engine type (use with --engine-url)
+    /// Manually specify engine type: vllm or sglang (use with --engine-url)
     #[arg(
         long,
         value_name = "TYPE",
@@ -215,6 +215,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         .filter_map(|(engine_str, url)| {
             let engine_type = match engine_str.to_lowercase().as_str() {
                 "vllm" => EngineType::Vllm,
+                "sglang" => EngineType::Sglang,
                 unknown => {
                     tracing::warn!("Unknown engine type '{}', ignoring override", unknown);
                     return None;

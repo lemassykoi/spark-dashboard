@@ -1,11 +1,5 @@
 import { getProviderLogo } from '@/lib/providerLogo'
-import {
-  engineDisplayName,
-  formatEndpoint,
-  formatGpuIndexes,
-  modelMetadataWarning,
-  shortModelName,
-} from '@/lib/format'
+import { engineDisplayName, engineIconPath, formatEndpoint, formatGpuIndexes, modelMetadataWarning, shortModelName } from '@/lib/format'
 import type { EngineSnapshot } from '@/types/metrics'
 import { DeploymentChip, EngineChip, ProviderMark } from './engineIdentity'
 import { EnginePanelNotice, PanelNotice } from './PanelNotice'
@@ -102,7 +96,10 @@ function EngineIdentity({ engine }: { engine: EngineSnapshot }) {
           when unknown rather than rendered as a dash — an absent chip reads as
           "not reported", which is what it means. */}
       <div className="min-w-0 max-w-full flex items-start gap-1.5 flex-wrap content-start">
-        <EngineChip label={engineDisplayName(engine.engine_type)} iconSrc="/icons/vllm.svg" />
+        <EngineChip
+          label={engineDisplayName(engine.engine_type)}
+          iconSrc={engineIconPath(engine.engine_type)}
+        />
         <DeploymentChip mode={engine.deployment_mode} />
         {engine.gpu_indexes && engine.gpu_indexes.length > 0 && (
           <EngineChip label={formatGpuIndexes(engine.gpu_indexes)} />

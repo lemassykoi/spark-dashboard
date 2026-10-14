@@ -1,0 +1,168 @@
+# Captured from a real SGLang v0.5.2x (qwen4-main nightly) instance on a
+# GB10 (DGX Spark class) with --enable-metrics and speculative decoding
+# (EAGLE/NEXTN) configured. Trimmed to contiguous per-metric blocks; all
+# label series (engine_type, is_streaming, model_name, ...) are kept verbatim.
+
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{engine_type="unified",is_streaming="false",model_name="qwen3.8-flash-next"} 1.044544e+06
+sglang:prompt_tokens_total{engine_type="unified",is_streaming="true",model_name="qwen3.8-flash-next"} 2.2606659e+07
+# HELP sglang:generation_tokens_total Number of generation tokens processed.
+# TYPE sglang:time_to_first_token_seconds histogram
+sglang:time_to_first_token_seconds_sum{engine_type="unified",is_streaming="false",model_name="qwen3.8-flash-next"} 2482.307983730003
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="0.25",model_name="qwen3.8-flash-next"} 1.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="0.5",model_name="qwen3.8-flash-next"} 4.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="0.75",model_name="qwen3.8-flash-next"} 4.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="1.0",model_name="qwen3.8-flash-next"} 4.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="1.5",model_name="qwen3.8-flash-next"} 4.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="2.0",model_name="qwen3.8-flash-next"} 37.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="3.0",model_name="qwen3.8-flash-next"} 50.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="4.0",model_name="qwen3.8-flash-next"} 67.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="6.0",model_name="qwen3.8-flash-next"} 85.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="8.0",model_name="qwen3.8-flash-next"} 94.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="12.0",model_name="qwen3.8-flash-next"} 97.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="20.0",model_name="qwen3.8-flash-next"} 97.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="30.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="45.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="60.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="false",le="+Inf",model_name="qwen3.8-flash-next"} 104.0
+sglang:time_to_first_token_seconds_count{engine_type="unified",is_streaming="false",model_name="qwen3.8-flash-next"} 104.0
+sglang:time_to_first_token_seconds_sum{engine_type="unified",is_streaming="true",model_name="qwen3.8-flash-next"} 896.5535349539932
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="0.25",model_name="qwen3.8-flash-next"} 1.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="0.5",model_name="qwen3.8-flash-next"} 4.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="0.75",model_name="qwen3.8-flash-next"} 43.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="1.0",model_name="qwen3.8-flash-next"} 80.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="1.5",model_name="qwen3.8-flash-next"} 104.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="2.0",model_name="qwen3.8-flash-next"} 144.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="3.0",model_name="qwen3.8-flash-next"} 164.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="4.0",model_name="qwen3.8-flash-next"} 177.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="6.0",model_name="qwen3.8-flash-next"} 179.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="8.0",model_name="qwen3.8-flash-next"} 181.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="12.0",model_name="qwen3.8-flash-next"} 183.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="20.0",model_name="qwen3.8-flash-next"} 185.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="30.0",model_name="qwen3.8-flash-next"} 188.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="45.0",model_name="qwen3.8-flash-next"} 188.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="60.0",model_name="qwen3.8-flash-next"} 190.0
+sglang:time_to_first_token_seconds_bucket{engine_type="unified",is_streaming="true",le="+Inf",model_name="qwen3.8-flash-next"} 195.0
+sglang:time_to_first_token_seconds_count{engine_type="unified",is_streaming="true",model_name="qwen3.8-flash-next"} 195.0
+# HELP sglang:e2e_request_latency_seconds Histogram of End-to-end request latency in seconds
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
+# HELP sglang:num_grammar_queue_reqs The number of requests in the grammar waiting queue.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 1.0
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:queue_time_seconds histogram
+sglang:queue_time_seconds_sum{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 566.125732611974
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.001",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9559.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.005",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9723.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.01",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9728.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.05",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.1",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.2",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="0.5",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="1.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="2.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="3.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="4.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="5.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="10.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="15.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="20.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="30.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="40.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9729.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="50.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9730.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="60.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9730.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="70.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9730.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="80.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9732.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="90.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9732.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="100.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9732.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="200.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9732.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="300.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9732.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="400.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="500.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="600.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="700.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="800.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="900.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="1000.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="1200.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="1400.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="1600.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="1800.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="2000.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="2500.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="3000.0",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_bucket{engine_type="unified",le="+Inf",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+sglang:queue_time_seconds_count{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 9733.0
+# HELP sglang:eviction_duration_seconds End-to-end time of a device eviction pass in seconds; under --hicache-write-policy write_back this includes the blocking D->H backup (see sglang:hicache_backup_duration_seconds for the copy alone).
+# TYPE sglang:spec_accept_length gauge
+sglang:spec_accept_length{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 2.8
+# HELP sglang:spec_accept_rate Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).
+# TYPE sglang:inter_token_latency_seconds histogram
+sglang:inter_token_latency_seconds_sum{engine_type="unified",model_name="qwen3.8-flash-next"} 5016.875728243736
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.005",model_name="qwen3.8-flash-next"} 1068.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.0075",model_name="qwen3.8-flash-next"} 1077.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.01",model_name="qwen3.8-flash-next"} 1083.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.0125",model_name="qwen3.8-flash-next"} 1088.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.015",model_name="qwen3.8-flash-next"} 1091.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.02",model_name="qwen3.8-flash-next"} 49427.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.025",model_name="qwen3.8-flash-next"} 79899.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.03",model_name="qwen3.8-flash-next"} 108901.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.04",model_name="qwen3.8-flash-next"} 127798.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.05",model_name="qwen3.8-flash-next"} 136725.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.07",model_name="qwen3.8-flash-next"} 138327.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.09",model_name="qwen3.8-flash-next"} 153451.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.12",model_name="qwen3.8-flash-next"} 155798.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.16",model_name="qwen3.8-flash-next"} 155970.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="0.25",model_name="qwen3.8-flash-next"} 156034.0
+sglang:inter_token_latency_seconds_bucket{engine_type="unified",le="+Inf",model_name="qwen3.8-flash-next"} 156088.0
+sglang:inter_token_latency_seconds_count{engine_type="unified",model_name="qwen3.8-flash-next"} 156088.0
+# HELP sglang:startup_time_seconds Engine startup duration by phase in seconds.
+# TYPE sglang:full_token_usage gauge
+sglang:full_token_usage{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.3813953488372093
+# HELP sglang:swa_token_usage The token usage for SWA layers.
+# TYPE sglang:spec_accept_rate gauge
+sglang:spec_accept_rate{engine_type="unified",model_name="qwen3.8-flash-next",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.6
+# HELP sglang:spec_cap_length Mean DSpark confidence-scheduled verify window per verify step, incl the bonus slot (0 when no cap is scheduled).
+# TYPE sglang:e2e_request_latency_seconds histogram
+sglang:e2e_request_latency_seconds_sum{engine_type="unified",is_streaming="false",model_name="qwen3.8-flash-next"} 3017.371048383975
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="1.0",model_name="qwen3.8-flash-next"} 4.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="2.0",model_name="qwen3.8-flash-next"} 4.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="5.0",model_name="qwen3.8-flash-next"} 33.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="10.0",model_name="qwen3.8-flash-next"} 72.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="15.0",model_name="qwen3.8-flash-next"} 81.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="20.0",model_name="qwen3.8-flash-next"} 86.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="30.0",model_name="qwen3.8-flash-next"} 94.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="45.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="60.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="90.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="120.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="180.0",model_name="qwen3.8-flash-next"} 98.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="300.0",model_name="qwen3.8-flash-next"} 100.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="false",le="+Inf",model_name="qwen3.8-flash-next"} 104.0
+sglang:e2e_request_latency_seconds_count{engine_type="unified",is_streaming="false",model_name="qwen3.8-flash-next"} 104.0
+sglang:e2e_request_latency_seconds_sum{engine_type="unified",is_streaming="true",model_name="qwen3.8-flash-next"} 5380.426404583952
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="1.0",model_name="qwen3.8-flash-next"} 2.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="2.0",model_name="qwen3.8-flash-next"} 2.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="5.0",model_name="qwen3.8-flash-next"} 10.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="10.0",model_name="qwen3.8-flash-next"} 51.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="15.0",model_name="qwen3.8-flash-next"} 84.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="20.0",model_name="qwen3.8-flash-next"} 117.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="30.0",model_name="qwen3.8-flash-next"} 142.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="45.0",model_name="qwen3.8-flash-next"} 162.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="60.0",model_name="qwen3.8-flash-next"} 174.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="90.0",model_name="qwen3.8-flash-next"} 186.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="120.0",model_name="qwen3.8-flash-next"} 189.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="180.0",model_name="qwen3.8-flash-next"} 194.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="300.0",model_name="qwen3.8-flash-next"} 195.0
+sglang:e2e_request_latency_seconds_bucket{engine_type="unified",is_streaming="true",le="+Inf",model_name="qwen3.8-flash-next"} 195.0
+sglang:e2e_request_latency_seconds_count{engine_type="unified",is_streaming="true",model_name="qwen3.8-flash-next"} 195.0
+# HELP sglang:prompt_tokens_histogram Histogram of prompt token length.
+# TYPE sglang:generation_tokens_total counter
+sglang:generation_tokens_total{engine_type="unified",is_streaming="false",model_name="qwen3.8-flash-next"} 28264.0
+sglang:generation_tokens_total{engine_type="unified",is_streaming="true",model_name="qwen3.8-flash-next"} 138138.0
+# HELP sglang:spec_verify_calls_total Number of speculative decoding verification calls.
+# TYPE sglang:cached_tokens_total counter
+sglang:cached_tokens_total{cache_source="device",engine_type="unified",model_name="qwen3.8-flash-next"} 2.1696064e+07
+# HELP sglang:per_stage_req_latency_seconds The latency of each stage of requests.

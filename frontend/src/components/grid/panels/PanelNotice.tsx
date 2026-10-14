@@ -1,5 +1,10 @@
 import type { ReactNode } from 'react'
-import { engineDescription, notReportedByAnyMessage, notReportedMessage } from '@/lib/format'
+import {
+  engineDescription,
+  metricsOffMessage,
+  notReportedByAnyMessage,
+  notReportedMessage,
+} from '@/lib/format'
 import type { EnginePanelNoticeState } from './useEnginePanel'
 import type { GpuPanelResolution } from './useGpuPanel'
 
@@ -37,6 +42,13 @@ export function EnginePanelNotice({ resolution }: { resolution: EnginePanelNotic
     // so a combined zero would be a figure nobody measured.
     case 'not-reported-by-any':
       return <PanelNotice>{notReportedByAnyMessage(resolution.groups)}</PanelNotice>
+    // The engine serves and could report these metrics — it was launched
+    // without the flag that publishes them. "Does not report" would blame
+    // the engine; this names the fix (ADR-0004's distinct wire state).
+    case 'metrics-off':
+      return (
+        <PanelNotice>{metricsOffMessage(resolution.engine, resolution.flag)}</PanelNotice>
+      )
     case 'starting':
       return <PanelNotice>{engineDescription(resolution.engine)} has no metrics yet.</PanelNotice>
     case 'offline':

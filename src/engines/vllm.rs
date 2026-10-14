@@ -139,155 +139,172 @@ impl VllmAdapter {
         }
     }
 
-    /// Cooldown between HF API retries after a failed request.
-    const HF_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
-
-    /// Fetch model metadata from the HuggingFace model-info API.
-    ///
-    /// Uses an internal cache so the API is called at most once per engine
-    /// lifetime. On failure, a 60-second cooldown prevents hammering the HF
-    /// API on every 1-second poll cycle.
+    /// Cooldown and caching live in `fetch_hf_model_info` (shared with the
+    /// SGLang adapter); this is the endpoint-scoped view of it.
     async fn fetch_hf_model_info(&self, model_id: &str) -> Option<ModelInfo> {
-        // Cache hit — model metadata never changes at runtime. Only for the
-        // same id, though: the name can legitimately change once, when an
-        // auth-gated `/v1/models` starts answering and replaces the
-        // command-line fallback the cache was filled from. A stale entry
-        // must not keep renaming the model back.
-        {
-            let cache = self.hf_model_cache.lock().await;
-            if let Some(cached) = cache.as_ref() {
-                if cached.name == model_id {
-                    return Some(cached.clone());
-                }
+        fetch_hf_model_info(
+            &self.endpoint,
+            model_id,
+            &self.hf_model_cache,
+            &self.last_hf_error,
+        )
+        .await
+    }
+}
+
+/// Cooldown between HF API retries after a failed request.
+const HF_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Fetch model metadata from the HuggingFace model-info API.
+///
+/// Uses an internal cache so the API is called at most once per engine
+/// lifetime. On failure, a 60-second cooldown prevents hammering the HF
+/// API on every 1-second poll cycle.
+pub(crate) async fn fetch_hf_model_info(
+    endpoint: &str,
+    model_id: &str,
+    cache: &Mutex<Option<ModelInfo>>,
+    last_error: &Mutex<Option<Instant>>,
+) -> Option<ModelInfo> {
+    // Cache hit — model metadata never changes at runtime. Only for the
+    // same id, though: the name can legitimately change once, when an
+    // auth-gated `/v1/models` starts answering and replaces the
+    // command-line fallback the cache was filled from. A stale entry
+    // must not keep renaming the model back.
+    {
+        let cache = cache.lock().await;
+        if let Some(cached) = cache.as_ref() {
+            if cached.name == model_id {
+                return Some(cached.clone());
             }
         }
+    }
 
-        // Cooldown check — don't retry on every 1-second poll.
-        {
-            let last = self.last_hf_error.lock().await;
-            if let Some(when) = *last {
-                if when.elapsed() < Self::HF_RETRY_COOLDOWN {
-                    return None;
-                }
+    // Cooldown check — don't retry on every 1-second poll.
+    {
+        let last = last_error.lock().await;
+        if let Some(when) = *last {
+            if when.elapsed() < HF_RETRY_COOLDOWN {
+                return None;
             }
         }
+    }
 
-        // Only HF-format names can be resolved — bare serve names have no
-        // `org/name` shape, and a filesystem path (a local-directory launch
-        // that `normalize_model_id` could not map back to a repo id) is not
-        // an HF repo either.
-        if !model_id.contains('/') || model_id.starts_with(['/', '.', '~']) {
+    // Only HF-format names can be resolved — bare serve names have no
+    // `org/name` shape, and a filesystem path (a local-directory launch
+    // that `normalize_model_id` could not map back to a repo id) is not
+    // an HF repo either.
+    if !model_id.contains('/') || model_id.starts_with(['/', '.', '~']) {
+        return None;
+    }
+
+    let url = format!("https://huggingface.co/api/models/{}", model_id);
+
+    let hf_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let resp = match hf_client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            let status = r.status();
+            if is_expected_hf_miss(status.as_u16()) {
+                // Not a public HF repo (local/custom serve name or gated
+                // model without a token) — expected, enrichment is optional.
+                tracing::debug!(
+                    endpoint = %endpoint,
+                    model_id = %model_id,
+                    status = %status,
+                    "HF model info unavailable (model not public on HuggingFace); skipping enrichment",
+                );
+            } else {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    model_id = %model_id,
+                    status = %status,
+                    "HF model info API returned non-success",
+                );
+            }
+            *last_error.lock().await = Some(Instant::now());
             return None;
         }
+        Err(e) => {
+            tracing::warn!(
+                endpoint = %endpoint,
+                model_id = %model_id,
+                error = %e,
+                "HF model info API request failed",
+            );
+            *last_error.lock().await = Some(Instant::now());
+            return None;
+        }
+    };
 
-        let url = format!("https://huggingface.co/api/models/{}", model_id);
+    let hf: HfModelResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                endpoint = %endpoint,
+                model_id = %model_id,
+                error = %e,
+                "HF model info response deserialization failed",
+            );
+            *last_error.lock().await = Some(Instant::now());
+            return None;
+        }
+    };
 
-        let hf_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .ok()?;
+    let parameter_size = hf
+        .safetensors
+        .as_ref()
+        .and_then(|s| s.total)
+        .map(format_param_size);
 
-        let resp = match hf_client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                let status = r.status();
-                if is_expected_hf_miss(status.as_u16()) {
-                    // Not a public HF repo (local/custom serve name or gated
-                    // model without a token) — expected, enrichment is optional.
-                    tracing::debug!(
-                        endpoint = %self.endpoint,
-                        model_id = %model_id,
-                        status = %status,
-                        "HF model info unavailable (model not public on HuggingFace); skipping enrichment",
-                    );
-                } else {
-                    tracing::warn!(
-                        endpoint = %self.endpoint,
-                        model_id = %model_id,
-                        status = %status,
-                        "HF model info API returned non-success",
-                    );
-                }
-                *self.last_hf_error.lock().await = Some(Instant::now());
-                return None;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %self.endpoint,
-                    model_id = %model_id,
-                    error = %e,
-                    "HF model info API request failed",
-                );
-                *self.last_hf_error.lock().await = Some(Instant::now());
-                return None;
-            }
-        };
+    let quant_config = hf
+        .config
+        .as_ref()
+        .and_then(|c| c.quantization_config.as_ref());
 
-        let hf: HfModelResponse = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %self.endpoint,
-                    model_id = %model_id,
-                    error = %e,
-                    "HF model info response deserialization failed",
-                );
-                *self.last_hf_error.lock().await = Some(Instant::now());
-                return None;
-            }
-        };
+    let quantization = quant_config
+        .and_then(|q| q.quant_method.as_deref())
+        .map(format_quant_method);
 
-        let parameter_size = hf
-            .safetensors
-            .as_ref()
-            .and_then(|s| s.total)
-            .map(format_param_size);
+    let precision = quant_config.and_then(|q| q.bits).map(format_precision);
 
-        let quant_config = hf
-            .config
-            .as_ref()
-            .and_then(|c| c.quantization_config.as_ref());
+    let tensor_type = hf
+        .safetensors
+        .as_ref()
+        .and_then(|s| s.parameters.as_ref())
+        .and_then(format_tensor_type);
 
-        let quantization = quant_config
-            .and_then(|q| q.quant_method.as_deref())
-            .map(format_quant_method);
+    let model_type = hf.config.as_ref().and_then(|c| c.model_type.clone());
 
-        let precision = quant_config.and_then(|q| q.bits).map(format_precision);
+    let result = ModelInfo {
+        name: model_id.to_string(),
+        parameter_size,
+        quantization,
+        precision,
+        tensor_type,
+        model_type,
+        pipeline_tag: hf.pipeline_tag,
+    };
 
-        let tensor_type = hf
-            .safetensors
-            .as_ref()
-            .and_then(|s| s.parameters.as_ref())
-            .and_then(format_tensor_type);
+    *cache.lock().await = Some(result.clone());
 
-        let model_type = hf.config.as_ref().and_then(|c| c.model_type.clone());
+    tracing::info!(
+        endpoint = %endpoint,
+        model_id = %model_id,
+        parameter_size = ?result.parameter_size,
+        quantization = ?result.quantization,
+        precision = ?result.precision,
+        tensor_type = ?result.tensor_type,
+        model_type = ?result.model_type,
+        pipeline_tag = ?result.pipeline_tag,
+        "Fetched model info from HuggingFace",
+    );
 
-        let result = ModelInfo {
-            name: model_id.to_string(),
-            parameter_size,
-            quantization,
-            precision,
-            tensor_type,
-            model_type,
-            pipeline_tag: hf.pipeline_tag,
-        };
-
-        *self.hf_model_cache.lock().await = Some(result.clone());
-
-        tracing::info!(
-            endpoint = %self.endpoint,
-            model_id = %model_id,
-            parameter_size = ?result.parameter_size,
-            quantization = ?result.quantization,
-            precision = ?result.precision,
-            tensor_type = ?result.tensor_type,
-            model_type = ?result.model_type,
-            pipeline_tag = ?result.pipeline_tag,
-            "Fetched model info from HuggingFace",
-        );
-
-        Some(result)
-    }
+    Some(result)
 }
 
 /// Recover a human-readable model id from a filesystem path.
@@ -306,7 +323,7 @@ impl VllmAdapter {
 ///   display name falls back to the containing directory instead of the hash.
 /// * Anything else — HF ids, custom serve names, plain paths — passes
 ///   through unchanged.
-fn normalize_model_id(id: &str) -> String {
+pub(crate) fn normalize_model_id(id: &str) -> String {
     if !id.contains('/') {
         return id.to_string();
     }
@@ -340,13 +357,13 @@ fn normalize_model_id(id: &str) -> String {
 /// resolvable — local/custom serve names (e.g. a vLLM `--served-model-name`),
 /// or gated/private repos accessed without a token. Metadata enrichment is
 /// best-effort, so these are expected and logged at debug rather than warn.
-fn is_expected_hf_miss(status: u16) -> bool {
+pub(crate) fn is_expected_hf_miss(status: u16) -> bool {
     matches!(status, 401 | 403 | 404)
 }
 
 /// What the engine's `/v1/models` endpoint had to say, reduced to the cases
 /// the name resolution cares about.
-enum ModelsEndpointReply {
+pub(crate) enum ModelsEndpointReply {
     /// A model id was returned.
     Resolved(String),
     /// The endpoint answered successfully but listed no models.
@@ -359,7 +376,7 @@ enum ModelsEndpointReply {
 /// lacks the engine's API key — the one failure an operator fixes on the
 /// dashboard's side (configure a provider API key), so it gets its own
 /// reason; everything else is generic unavailability.
-fn classify_models_error_status(status: u16) -> ModelMetadataError {
+pub(crate) fn classify_models_error_status(status: u16) -> ModelMetadataError {
     match status {
         401 | 403 => ModelMetadataError::AuthRequired,
         _ => ModelMetadataError::Unavailable,
@@ -379,7 +396,7 @@ fn classify_models_error_status(status: u16) -> ModelMetadataError {
 /// When the endpoint failed or listed nothing, the hint is all there is, and
 /// the metadata error travels with it — the fallback name is shown, but the
 /// frontend can say it is only a fallback.
-fn resolve_model_name(
+pub(crate) fn resolve_model_name(
     reply: &ModelsEndpointReply,
     hint: Option<&str>,
 ) -> (Option<String>, Option<ModelMetadataError>) {
@@ -401,19 +418,19 @@ fn resolve_model_name(
 }
 
 #[derive(Deserialize)]
-struct OpenAIModelsResponse {
+pub(crate) struct OpenAIModelsResponse {
     #[serde(default)]
-    data: Vec<OpenAIModel>,
+    pub(crate) data: Vec<OpenAIModel>,
 }
 
 #[derive(Deserialize)]
-struct OpenAIModel {
-    id: String,
+pub(crate) struct OpenAIModel {
+    pub(crate) id: String,
 }
 
 /// Response shape for GET https://huggingface.co/api/models/{model_id}
 #[derive(Deserialize)]
-struct HfModelResponse {
+pub(crate) struct HfModelResponse {
     pipeline_tag: Option<String>,
     safetensors: Option<HfSafetensors>,
     #[serde(default)]
@@ -421,21 +438,21 @@ struct HfModelResponse {
 }
 
 #[derive(Deserialize)]
-struct HfSafetensors {
+pub(crate) struct HfSafetensors {
     total: Option<u64>,
     #[serde(default)]
     parameters: Option<std::collections::HashMap<String, u64>>,
 }
 
 #[derive(Deserialize)]
-struct HfConfig {
+pub(crate) struct HfConfig {
     #[serde(default)]
     model_type: Option<String>,
     quantization_config: Option<HfQuantizationConfig>,
 }
 
 #[derive(Deserialize)]
-struct HfQuantizationConfig {
+pub(crate) struct HfQuantizationConfig {
     bits: Option<u64>,
     quant_method: Option<String>,
 }

@@ -361,6 +361,7 @@ mod tests {
             model: None,
             model_metadata_error: None,
             metric_groups: MetricGroup::all(),
+            metrics_off: None,
             metrics: None,
             recent_requests: Vec::new(),
             deployment_mode: match container_id {
