@@ -7,6 +7,8 @@ import {
   formatAcceptanceLength,
   formatEndpoint,
   engineDescription,
+  engineDisplayName,
+  engineIconPath,
   metricGroupName,
   modelMetadataWarning,
   notReportedByAnyMessage,
@@ -115,6 +117,15 @@ describe('engineDescription', () => {
     expect(engineDescription({ engine_type: 'Vllm', endpoint: 'http://localhost:8001' })).toBe(
       'vLLM localhost:8001',
     )
+  })
+})
+
+describe('engineDisplayName and engineIconPath', () => {
+  it('names each engine type and points at its own icon', () => {
+    expect(engineDisplayName('Vllm')).toBe('vLLM')
+    expect(engineIconPath('Vllm')).toBe('/icons/vllm.svg')
+    expect(engineDisplayName('Sglang')).toBe('SGLang')
+    expect(engineIconPath('Sglang')).toBe('/icons/sglang.svg')
   })
 })
 

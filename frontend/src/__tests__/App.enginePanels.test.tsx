@@ -334,6 +334,26 @@ describe('the engine panels on a grid page', () => {
     }
   })
 
+  // The engine chip's icon is the engine type's own — the status panel used
+  // to show vLLM's on every engine.
+  it.each([
+    ['Vllm', 'vLLM', '/icons/vllm.svg'],
+    ['Sglang', 'SGLang', '/icons/sglang.svg'],
+  ] as const)('shows a %s engine under its own name and icon', async (engineType, name, icon) => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'who', type: 'engine-status', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(makeSnapshot(1000, [makeEngine(ALPHA, { engine_type: engineType })]))
+
+    const chip = within(region('Engine')).getByText(name).parentElement
+    expect(chip?.querySelector('img')?.getAttribute('src')).toBe(icon)
+  })
+
   it('says an engine has no model rather than showing an empty identity', async () => {
     // The auth-gated case: /v1/models is refused, so the engine is up and
     // reporting metrics with nothing to say about what it is serving.
