@@ -123,6 +123,11 @@ fn merge_docker_candidates(
 /// Matches the entrypoint forms the process scanner already recognizes, so a
 /// container is judged by the same evidence a host process is: the binary being
 /// run, not a name somebody chose.
+///
+/// Like everything the container classification uses, only reachable from the
+/// Linux Docker path in normal builds, but the unit tests exercise it on every
+/// platform — hence the `test` cfg.
+#[cfg(any(target_os = "linux", test))]
 fn is_vllm_process(command: &str) -> bool {
     command.split_whitespace().any(vllm_arg_is_server)
 }
@@ -144,6 +149,7 @@ fn vllm_arg_is_server(arg: &str) -> bool {
 /// "sglang-sidecar" runs nothing until a command line proves otherwise, and
 /// an argument that merely contains "sglang" (a path, a config file) is not
 /// the server itself.
+#[cfg(any(target_os = "linux", test))]
 fn is_sglang_process(command: &str) -> bool {
     command.split_whitespace().any(sglang_arg_is_server)
 }
@@ -168,6 +174,7 @@ fn cmd_proves_engine(cmd: &[std::ffi::OsString], engine_type: &EngineType) -> bo
 
 /// What a container's declared name, image and command say about which
 /// engine (if any) it runs, and how far to trust that.
+#[cfg(any(target_os = "linux", test))]
 struct ContainerClass {
     engine_type: EngineType,
     /// The image or command named this engine type — trusted as-is. A
@@ -187,6 +194,11 @@ struct ContainerClass {
 /// Ties without an image signal go to vLLM: no one builds a "vllm-sglang"
 /// image on purpose, and the mismatched container is more plausibly a vLLM
 /// deployment with sglang in a sidecar name than the reverse.
+///
+/// Only reachable from the Linux Docker path in normal builds — it names the
+/// Linux-only command parsers — but the unit tests exercise it on every
+/// platform, hence the `test` cfg.
+#[cfg(any(target_os = "linux", test))]
 fn classify_container(names: &[String], image: &str, command: &str) -> Option<ContainerClass> {
     let named = |needle: &str| names.iter().any(|n| n.to_lowercase().contains(needle));
     let (image_vllm, image_sglang) = (image.contains("vllm"), image.contains("sglang"));
