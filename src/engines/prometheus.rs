@@ -62,12 +62,13 @@ impl ParsedMetrics {
 /// series, as a plain name-keyed map would, reports a fraction of the engine
 /// that depends on exposition order.
 pub fn parse_prometheus_text(body: &str) -> Option<ParsedMetrics> {
-    // Normalize colons in metric name prefixes to underscores. vLLM uses colons
-    // (e.g. "vllm:kv_cache_usage_perc") which are reserved for Prometheus recording
-    // rules and get silently dropped by prometheus-parse. Replace in both metric
-    // lines and # TYPE/# HELP lines so the parser can match samples to their type
+    // Normalize colons in metric name prefixes to underscores. vLLM and SGLang
+    // use colons (e.g. "vllm:kv_cache_usage_perc", "sglang:num_running_reqs")
+    // which are reserved for Prometheus recording rules and get silently
+    // dropped by prometheus-parse. Replace in both metric lines and
+    // # TYPE/# HELP lines so the parser can match samples to their type
     // declarations.
-    let normalized = body.replace("vllm:", "vllm_");
+    let normalized = body.replace("vllm:", "vllm_").replace("sglang:", "sglang_");
 
     let reader = std::io::BufReader::new(normalized.as_bytes());
     let scrape = prometheus_parse::Scrape::parse(reader.lines()).ok()?;

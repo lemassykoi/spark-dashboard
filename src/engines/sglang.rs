@@ -1,5 +1,5 @@
 use super::histogram::{fraction_le, percentile};
-use super::prometheus::{parse_prometheus_text, ParsedMetrics};
+use super::prometheus::{parse_prometheus_text, GaugeSeries, ParsedMetrics};
 use super::vllm::{
     classify_models_error_status, fetch_hf_model_info, normalize_model_id, resolve_model_name,
     ModelsEndpointReply, OpenAIModelsResponse,
@@ -11,7 +11,7 @@ use super::{
     TTFT_SLO_MS,
 };
 use async_trait::async_trait;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -88,101 +88,59 @@ impl SglangAdapter {
     }
 }
 
-/// Aggregate a SGLang metrics body into the single-sample-per-name shape the
-/// shared Prometheus parser stores.
+/// Parse an SGLang scrape with the shared parser, which sums counters and
+/// histograms across the label series SGLang splits them into
+/// (`is_streaming`, `cache_source`, and one series per rank), and keep each
+/// gauge's series for `engine_metrics` to combine per what it measures.
 ///
-/// Two properties of SGLang's exposition the vLLM-shaped parser cannot carry:
-///
-/// * Colon-prefixed metric names (`sglang:num_running_reqs`). The parser
-///   normalizes only the `vllm:` prefix — and its replacement here does the
-///   same rename so lookups below use underscored names.
-/// * The same logical series split across label sets — counters and
-///   histograms carry `is_streaming="true"/"false"` variants (streamed and
-///   non-streamed requests), and multi-rank launches add per-rank labels.
-///   The parser stores one value per name (last line wins), which silently
-///   drops the other variants' contributions and lets the reading depend on
-///   exposition order. Counters, histogram sums/counts and buckets are summed
-///   across their label series; gauges take the first occurrence (they are
-///   point-in-state values, and summing e.g. a usage ratio across ranks
-///   would be wrong as surely as picking one at random is right only by
-///   accident).
-fn aggregate_sglang_body(body: &str) -> Option<String> {
-    let mut counters: Vec<(String, f64)> = Vec::new(); // ordered, summed
-    let mut buckets: HashMap<(String, String), f64> = HashMap::new();
-    let mut first_wins: HashMap<String, f64> = HashMap::new();
-    let mut histogram_order: Vec<String> = Vec::new();
-
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some(space) = line.rfind(' ') else {
-            continue;
-        };
-        let (key, value) = (&line[..space], &line[space + 1..]);
-        let Ok(value) = value.parse::<f64>() else {
-            continue;
-        };
-        let name = match key.find('{') {
-            Some(brace) => &key[..brace],
-            None => key,
-        };
-        let name = name.replace("sglang:", "sglang_");
-
-        if let Some(stem) = name.strip_suffix("_bucket").map(str::to_string) {
-            let le = match key.rfind("le=\"") {
-                Some(at) => match key[at + 4..].find('"') {
-                    Some(end) => key[at + 4..at + 4 + end].to_string(),
-                    None => continue,
-                },
-                None => continue,
-            };
-            if !buckets.contains_key(&(stem.clone(), le.clone()))
-                && !histogram_order.iter().any(|h| h == &stem)
-            {
-                histogram_order.push(stem.clone());
-            }
-            *buckets.entry((stem, le)).or_insert(0.0) += value;
-        } else if name.ends_with("_sum") || name.ends_with("_count") || name.ends_with("_total") {
-            match counters.iter_mut().find(|(n, _)| *n == name) {
-                Some(slot) => slot.1 += value,
-                None => counters.push((name, value)),
-            }
-        } else {
-            first_wins.entry(name).or_insert(value);
-        }
+/// One SGLang-specific step: under `--enable-priority-scheduling` the
+/// scheduler logs each queue gauge twice, its total under `priority=""` and a
+/// breakdown under `priority="<n>"` beside it. Only the totals partition the
+/// engine, so the breakdown series are dropped before anything sums them.
+fn parse_sglang(body: &str) -> Option<ParsedMetrics> {
+    let mut parsed = parse_prometheus_text(body)?;
+    for series in parsed.gauges.values_mut() {
+        series.retain(|g| g.labels.get("priority").is_none_or(|p| p.is_empty()));
     }
+    Some(parsed)
+}
 
-    if counters.is_empty() && first_wins.is_empty() {
+/// Whether a parsed scrape carries any sample at all.
+fn has_samples(parsed: &ParsedMetrics) -> bool {
+    !(parsed.counters.is_empty() && parsed.gauges.is_empty() && parsed.histograms.is_empty())
+}
+
+/// SGLang's acceptance gauges, combined across the ranks that report them.
+///
+/// Each data-parallel rank logs its own `spec_accept_length` and
+/// `spec_accept_rate`, both over its last decode-log interval, and logs them
+/// as `0` until it has verified a draft — as a server without a drafter does
+/// for good. A rank that has verified one reports a length of at least 1, so
+/// the engine-wide figures are the means over the ranks whose length is
+/// positive, each rank's rate read off the series with the same labels.
+/// Returns `(length, rate)`; `None` while no rank has verified a draft.
+fn spec_acceptance(parsed: &ParsedMetrics) -> Option<(f64, Option<f64>)> {
+    let ranks: Vec<&GaugeSeries> = parsed
+        .gauges
+        .get("sglang_spec_accept_length")
+        .into_iter()
+        .flatten()
+        .filter(|g| g.value > 0.0)
+        .collect();
+    if ranks.is_empty() {
         return None;
     }
-
-    let mut out = String::new();
-    for (name, value) in counters {
-        out.push_str(&format!("{name} {value}\n"));
-    }
-    for (name, value) in first_wins {
-        out.push_str(&format!("{name} {value}\n"));
-    }
-    for stem in histogram_order {
-        let mut entries: Vec<(String, f64)> = buckets
-            .iter()
-            .filter(|((s, _), _)| *s == stem)
-            .map(|((_, le), v)| (le.clone(), *v))
-            .collect();
-        // Numeric le ascending, "+Inf" last — the parser's convention.
-        entries.sort_by(|a, b| {
-            let ka = a.0.parse::<f64>().unwrap_or(f64::MAX);
-            let kb = b.0.parse::<f64>().unwrap_or(f64::MAX);
-            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out.push_str(&format!("# TYPE {stem} histogram\n"));
-        for (le, count) in entries {
-            out.push_str(&format!("{stem}_bucket{{le=\"{le}\"}} {count}\n"));
-        }
-    }
-    Some(out)
+    let length = ranks.iter().map(|g| g.value).sum::<f64>() / ranks.len() as f64;
+    let rates: Vec<f64> = parsed
+        .gauges
+        .get("sglang_spec_accept_rate")
+        .into_iter()
+        .flatten()
+        .filter(|g| ranks.iter().any(|r| r.labels == g.labels))
+        .map(|g| g.value)
+        .collect();
+    let rate = (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64);
+    Some((length, rate))
 }
 
 #[async_trait]
@@ -313,18 +271,17 @@ impl EngineAdapter for SglangAdapter {
         // a scrape can answer are testable without a server. A failure to
         // reach the server never gets here — the `send()` above stops it —
         // because offline is not the same as off.
-        let aggregated = status
+        let parsed = status
             .is_success()
-            .then(|| aggregate_sglang_body(&body))
-            .flatten();
+            .then(|| parse_sglang(&body))
+            .flatten()
+            .filter(has_samples);
         if let Some(off) =
-            metrics_off_signal(status.is_success(), status.as_u16(), aggregated.is_some())
+            metrics_off_signal(status.is_success(), status.as_u16(), parsed.is_some())
         {
             self.metrics_off.store(off, Ordering::Relaxed);
         }
-        let aggregated = aggregated?;
-
-        let raw = parse_prometheus_text(&aggregated)?;
+        let raw = parsed?;
         let warmup_out = {
             let mut tracker = self.warmup.lock().await;
             tracker.observe(&raw)
@@ -454,21 +411,32 @@ fn metrics_off_signal(success: bool, code: u16, has_series: bool) -> Option<bool
     }
 }
 
-/// Map one aggregated, parsed SGLang scrape onto the engine snapshot.
+/// Map one parsed SGLang scrape onto the engine snapshot.
 /// Pure: the fetch, the metrics-off latch, the warmup tracker and the rate
 /// state stay in `get_metrics`; everything here reads the scrape and nothing
 /// else. `warming_up` blanks the delta-derived fields exactly as the vLLM
 /// adapter blanks them.
 fn engine_metrics(parsed: &ParsedMetrics, rates: RateInputs, warming_up: bool) -> EngineMetrics {
-    let gauge = |name: &str| parsed.gauge_sum(name);
     let counter = |name: &str| parsed.counters.get(name).copied();
 
-    let active_requests = gauge("sglang_num_running_reqs").map(|v| v as u64);
-    let queued_requests = gauge("sglang_num_queue_reqs").map(|v| v as u64);
+    // Each data-parallel rank logs its own series of the scheduler gauges
+    // (one per rank, from its attention-TP rank 0). The request counts
+    // partition the engine's work, so they sum.
+    let active_requests = parsed
+        .gauge_sum("sglang_num_running_reqs")
+        .map(|v| v as u64);
+    let queued_requests = parsed.gauge_sum("sglang_num_queue_reqs").map(|v| v as u64);
     // `full_token_usage` is the fraction of the token pool in use (0-1),
     // SGLang's counterpart of vLLM's kv_cache_usage_perc. Verified live
     // against v0.5.2x on a GB10: 0.381 at a 454k-token pool under load.
-    let kv_cache_percent = gauge("sglang_full_token_usage").map(|v| v * 100.0);
+    // Releases before the hybrid full/SWA split report only `token_usage`,
+    // the same fraction for a model with one pool. Each rank's usage is a
+    // ratio of its own pool, and data-parallel ranks size their pools alike,
+    // so the engine-wide figure is the mean.
+    let kv_cache_percent = parsed
+        .gauge_mean("sglang_full_token_usage")
+        .or_else(|| parsed.gauge_mean("sglang_token_usage"))
+        .map(|v| v * 100.0);
 
     let avg_ms = |sum: Option<f64>, count: Option<f64>| match (sum, count) {
         (Some(s), Some(c)) if c > 0.0 => Some((s / c) * 1000.0),
@@ -532,11 +500,9 @@ fn engine_metrics(parsed: &ParsedMetrics, rates: RateInputs, warming_up: bool) -
     // and a panel permanently showing 0% would be the worse of the two
     // readings. Nonzero length is the same configured signal the
     // frontend reads off vLLM's optional counters.
-    let spec_decode_mean_acceptance_length =
-        gauge("sglang_spec_accept_length").filter(|v| *v > 0.0);
-    let spec_decode_acceptance_rate = spec_decode_mean_acceptance_length
-        .and(gauge("sglang_spec_accept_rate"))
-        .map(|v| v * 100.0);
+    let acceptance = spec_acceptance(parsed);
+    let spec_decode_mean_acceptance_length = acceptance.map(|(length, _)| length);
+    let spec_decode_acceptance_rate = acceptance.and_then(|(_, rate)| rate).map(|v| v * 100.0);
 
     // Percentiles, goodput and shipped buckets from the request-level
     // histograms. Identical math to the vLLM adapter — SGLang's buckets
@@ -655,21 +621,12 @@ mod tests {
     /// A scrape of a real SGLang v0.5.2x (qwen4-main nightly) on a GB10,
     /// captured live with `--enable-metrics` and EAGLE/NEXTN speculative
     /// decoding configured. Trimming kept whole metric blocks; every label
-    /// series is verbatim, including the `is_streaming` splits that the
-    /// aggregation exists for.
+    /// series is verbatim, including the `is_streaming` splits the parser
+    /// sums.
     const REAL: &str = include_str!("fixtures/sglang_metrics.txt");
 
-    fn parsed_real() -> ParsedMetricsGuard {
-        let aggregated = aggregate_sglang_body(REAL).expect("fixture aggregates");
-        ParsedMetricsGuard(parse_prometheus_text(&aggregated).expect("fixture parses"))
-    }
-
-    struct ParsedMetricsGuard(super::super::prometheus::ParsedMetrics);
-    impl std::ops::Deref for ParsedMetricsGuard {
-        type Target = super::super::prometheus::ParsedMetrics;
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
+    fn parsed_real() -> ParsedMetrics {
+        parse_sglang(REAL).expect("fixture parses")
     }
 
     #[test]
@@ -683,9 +640,8 @@ mod tests {
         assert_eq!(p.gauge_sum("sglang_spec_accept_length"), Some(2.8));
     }
 
-    /// The whole point of aggregating: a counter split across streaming and
-    /// non-streaming label series is the sum of both, never whichever line
-    /// happened to come last.
+    /// A counter split across streaming and non-streaming label series is
+    /// the sum of both, never whichever line happened to come last.
     #[test]
     fn label_split_counters_are_summed_not_picked() {
         let p = parsed_real();
@@ -789,8 +745,7 @@ mod tests {
 
         // The prefix ratio and totals against the parsed counters directly,
         // including the label-series sums (streaming + non-streaming).
-        let aggregated = aggregate_sglang_body(REAL).unwrap();
-        let parsed = parse_prometheus_text(&aggregated).unwrap();
+        let parsed = parsed_real();
         let cached = parsed.counters["sglang_cached_tokens_total"];
         let prompt = parsed.counters["sglang_prompt_tokens_total"];
         assert!((prompt - 2.3651_203e7).abs() < 1.0, "label series summed");
@@ -833,8 +788,7 @@ mod tests {
                     sglang:spec_accept_rate{engine_type=\"unified\"} 0.0\n\
                     # TYPE sglang:spec_accept_length gauge\n\
                     sglang:spec_accept_length{engine_type=\"unified\"} 0.0\n";
-        let aggregated = aggregate_sglang_body(body).expect("aggregates");
-        let parsed = parse_prometheus_text(&aggregated).expect("parses");
+        let parsed = parse_sglang(body).expect("parses");
         let m = engine_metrics(&parsed, RateInputs::default(), false);
         assert_eq!(m.active_requests, Some(4));
         assert_eq!(m.spec_decode_acceptance_rate, None);
@@ -854,21 +808,126 @@ mod tests {
     }
 
     #[test]
-    fn an_exposition_without_samples_aggregates_to_nothing() {
+    fn an_exposition_without_samples_has_none() {
         // The metrics-off decision rests on this: a body that carries no
-        // sample at all (or a 404 body) yields None.
-        assert!(aggregate_sglang_body("# only a comment\n").is_none());
-        assert!(aggregate_sglang_body("").is_none());
+        // sample at all (or a 404 body) holds nothing to report.
+        let comment_only = parse_sglang("# only a comment\n").expect("parses");
+        assert!(!has_samples(&comment_only));
+        assert!(parse_sglang("").is_none_or(|p| !has_samples(&p)));
     }
 
-    /// A gauge is never summed — first occurrence wins (a usage ratio summed
-    /// across ranks would be nonsense).
+    /// With `--dp-size 2` each rank logs its own scheduler gauges. The engine
+    /// runs both ranks' requests, so counts sum; token usage is each rank's
+    /// own pool, so it averages; the acceptance figures average over the
+    /// ranks that have verified drafts, each rate paired with its rank.
     #[test]
-    fn gauges_are_first_wins() {
-        let body = "sglang:num_running_reqs 2.0\nsglang:num_running_reqs 5.0\n";
-        let aggregated = aggregate_sglang_body(body).expect("aggregates");
-        let parsed = parse_prometheus_text(&aggregated).expect("parses");
-        assert_eq!(parsed.gauge_sum("sglang_num_running_reqs"), Some(2.0));
+    fn data_parallel_ranks_combine_into_one_engine() {
+        let body = "\
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 8.0
+sglang:num_running_reqs{dp_rank=\"1\",model_name=\"m\",tp_rank=\"1\"} 7.0
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 2.0
+sglang:num_queue_reqs{dp_rank=\"1\",model_name=\"m\",tp_rank=\"1\"} 1.0
+# TYPE sglang:full_token_usage gauge
+sglang:full_token_usage{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 0.5
+sglang:full_token_usage{dp_rank=\"1\",model_name=\"m\",tp_rank=\"1\"} 0.3
+# TYPE sglang:spec_accept_length gauge
+sglang:spec_accept_length{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 3.0
+sglang:spec_accept_length{dp_rank=\"1\",model_name=\"m\",tp_rank=\"1\"} 2.0
+# TYPE sglang:spec_accept_rate gauge
+sglang:spec_accept_rate{dp_rank=\"1\",model_name=\"m\",tp_rank=\"1\"} 0.4
+sglang:spec_accept_rate{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 0.8
+";
+        let parsed = parse_sglang(body).expect("parses");
+        let m = engine_metrics(&parsed, RateInputs::default(), false);
+        assert_eq!(m.active_requests, Some(15));
+        assert_eq!(m.queued_requests, Some(3));
+        let kv = m.kv_cache_percent.expect("kv");
+        assert!((kv - 40.0).abs() < 1e-9, "mean of 50% and 30%, got {kv}");
+        assert_eq!(m.spec_decode_mean_acceptance_length, Some(2.5));
+        let rate = m.spec_decode_acceptance_rate.expect("rate");
+        assert!(
+            (rate - 60.0).abs() < 1e-9,
+            "mean of 80% and 40%, got {rate}"
+        );
+    }
+
+    /// A rank that has not verified a draft yet logs `0` and stays out of
+    /// the acceptance mean, rather than halving the other rank's figures.
+    #[test]
+    fn a_rank_without_verified_drafts_stays_out_of_the_acceptance_mean() {
+        let body = "\
+# TYPE sglang:spec_accept_length gauge
+sglang:spec_accept_length{dp_rank=\"0\"} 3.0
+sglang:spec_accept_length{dp_rank=\"1\"} 0.0
+# TYPE sglang:spec_accept_rate gauge
+sglang:spec_accept_rate{dp_rank=\"0\"} 0.8
+sglang:spec_accept_rate{dp_rank=\"1\"} 0.0
+";
+        let m = engine_metrics(
+            &parse_sglang(body).expect("parses"),
+            RateInputs::default(),
+            false,
+        );
+        assert_eq!(m.spec_decode_mean_acceptance_length, Some(3.0));
+        assert_eq!(m.spec_decode_acceptance_rate, Some(80.0));
+    }
+
+    /// Under priority scheduling a queue gauge carries its total under
+    /// `priority=""` and a per-priority breakdown beside it; summing all of
+    /// them would count every request twice.
+    #[test]
+    fn priority_breakdowns_do_not_count_twice() {
+        let body = "\
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name=\"m\",priority=\"\"} 5.0
+sglang:num_running_reqs{model_name=\"m\",priority=\"0\"} 3.0
+sglang:num_running_reqs{model_name=\"m\",priority=\"1\"} 2.0
+";
+        let m = engine_metrics(
+            &parse_sglang(body).expect("parses"),
+            RateInputs::default(),
+            false,
+        );
+        assert_eq!(m.active_requests, Some(5));
+    }
+
+    /// Releases before the hybrid full/SWA split report the pool's usage as
+    /// `token_usage` only; the KV tile reads it rather than going blank.
+    #[test]
+    fn kv_usage_falls_back_to_token_usage() {
+        let body = "\
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name=\"m\"} 0.25
+";
+        let m = engine_metrics(
+            &parse_sglang(body).expect("parses"),
+            RateInputs::default(),
+            false,
+        );
+        assert_eq!(m.kv_cache_percent, Some(25.0));
+    }
+
+    /// The bucket bound is the `le` label, read off the parsed label set —
+    /// not the last `le="` in the line, which a label like `role="decode"`
+    /// after it would turn into a bound of "decode".
+    #[test]
+    fn bucket_bounds_come_from_the_le_label_wherever_it_sits() {
+        let body = "\
+# TYPE sglang:time_to_first_token_seconds histogram
+sglang:time_to_first_token_seconds_bucket{le=\"0.5\",role=\"decode\"} 3
+sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",role=\"decode\"} 4
+";
+        let parsed = parse_sglang(body).expect("parses");
+        let ttft = parsed
+            .histograms
+            .get("sglang_time_to_first_token_seconds")
+            .expect("ttft histogram");
+        assert_eq!(ttft.len(), 2);
+        assert_eq!(ttft[0], (0.5, 3.0));
+        assert!(ttft[1].0.is_infinite());
+        assert_eq!(ttft[1].1, 4.0);
     }
 
     /// SGLang says "metrics off" with a flag name, not with an empty group
