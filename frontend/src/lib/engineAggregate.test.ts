@@ -189,6 +189,62 @@ describe('aggregateEngines', () => {
     expect(snap.spec_decode_mean_acceptance_length).toBeCloseTo(740 / 300, 5)
   })
 
+  // SGLang reports its acceptance figures as gauges and keeps no token
+  // counters, so it cannot enter the pooled sums; it enters with its own
+  // figures, weighted by its draft rounds — counted in the coverage, and in
+  // the figure too.
+  it('weights in an engine that reports only acceptance figures by its draft rounds', () => {
+    const vllm = engine(
+      'Running',
+      fullMetrics({
+        spec_decode_accepted_tokens_total: 720,
+        spec_decode_draft_tokens_total: 800,
+        spec_decode_drafts_total: 300,
+        spec_decode_acceptance_rate: 90,
+        spec_decode_mean_acceptance_length: 2.4,
+      }),
+      'http://localhost:8000',
+    )
+    const sglang = {
+      ...engine(
+        'Running',
+        fullMetrics({
+          spec_decode_drafts_total: 100,
+          spec_decode_acceptance_rate: 50,
+          spec_decode_mean_acceptance_length: 1.2,
+        }),
+        'http://localhost:30000',
+      ),
+      engine_type: 'Sglang' as const,
+    }
+
+    const snap = aggregateEngines([vllm, sglang])
+    // The pool (vLLM): TAR 720/800 = 90%, length 720/300 = 2.4, over 300
+    // rounds; SGLang: 50% and 1.2 over 100 rounds.
+    expect(snap.spec_decode_acceptance_rate).toBeCloseTo((90 * 300 + 50 * 100) / 400, 5)
+    expect(snap.spec_decode_mean_acceptance_length).toBeCloseTo((2.4 * 300 + 1.2 * 100) / 400, 5)
+    // The token counters are vLLM's alone; the draft rounds are everyone's.
+    expect(snap.spec_decode_accepted_tokens_total).toBe(720)
+    expect(snap.spec_decode_drafts_total).toBe(400)
+    expect(snap.coverage.included.SpeculativeDecoding).toBe(2)
+
+    // Alone, SGLang engines combine by their rounds too.
+    const alone = aggregateEngines([
+      sglang,
+      {
+        ...sglang,
+        endpoint: 'http://localhost:30001',
+        metrics: fullMetrics({
+          spec_decode_drafts_total: 300,
+          spec_decode_acceptance_rate: 70,
+          spec_decode_mean_acceptance_length: 2,
+        }),
+      },
+    ])
+    expect(alone.spec_decode_acceptance_rate).toBeCloseTo((50 * 100 + 70 * 300) / 400, 5)
+    expect(alone.spec_decode_mean_acceptance_length).toBeCloseTo((1.2 * 100 + 2 * 300) / 400, 5)
+  })
+
   it('blends live TAR weighted by each engine draft-token volume', () => {
     // Engine A: live 80%, 800 draft tokens; Engine B: live 20%, 200 draft.
     // Weighted mean = (80*800 + 20*200) / 1000 = 68.
