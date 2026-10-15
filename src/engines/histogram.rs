@@ -5,6 +5,9 @@
 //! tail latency in the dashboard we need percentiles, which the engine itself
 //! does not pre-compute.
 
+use super::prometheus::ParsedMetrics;
+use super::{HistogramBucket, LatencyPercentiles};
+
 /// Linear-interpolate a percentile from cumulative Prometheus histogram buckets.
 ///
 /// `buckets` must be sorted ascending by `le` and contain cumulative counts
@@ -111,6 +114,63 @@ pub fn fraction_le(buckets: &[(f64, f64)], threshold: f64) -> Option<f64> {
 
     // Threshold beyond all buckets and no +Inf — saturate at total.
     Some(1.0)
+}
+
+/// p50/p95/p99 in milliseconds of a latency histogram in seconds. `None`
+/// when the scrape has no such histogram, or when no quantile interpolates
+/// (e.g. only a `+Inf` bucket) — the UI then renders dashes.
+pub(crate) fn percentiles_ms(parsed: &ParsedMetrics, metric: &str) -> Option<LatencyPercentiles> {
+    let buckets = parsed.histograms.get(metric)?;
+    let to_ms = |q: f64| percentile(buckets, q).map(|s| s * 1000.0);
+    let p = LatencyPercentiles {
+        p50_ms: to_ms(0.50),
+        p95_ms: to_ms(0.95),
+        p99_ms: to_ms(0.99),
+    };
+    // If every quantile is None, collapse to None so the JSON payload stays
+    // compact.
+    if p.p50_ms.is_none() && p.p95_ms.is_none() && p.p99_ms.is_none() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Goodput: the percentage (0-100) of a latency histogram's observations
+/// meeting `slo_ms`. The histogram is in seconds, so the threshold is
+/// converted before `fraction_le` reads it.
+pub(crate) fn goodput_pct(parsed: &ParsedMetrics, metric: &str, slo_ms: f64) -> Option<f64> {
+    let buckets = parsed.histograms.get(metric)?;
+    fraction_le(buckets, slo_ms / 1000.0).map(|f| f * 100.0)
+}
+
+/// A histogram's buckets as shipped to the frontend, which recomputes goodput
+/// at user-customized SLO thresholds without a roundtrip. `+Inf` becomes
+/// `f64::MAX`, because serde_json cannot encode non-finite floats — the
+/// frontend port of `fraction_le` treats that sentinel as the overflow bucket.
+pub(crate) fn wire_buckets(parsed: &ParsedMetrics, metric: &str) -> Option<Vec<HistogramBucket>> {
+    let raw = parsed.histograms.get(metric)?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        raw.iter()
+            .map(|&(le, cum)| HistogramBucket {
+                le_seconds: if le.is_finite() { le } else { f64::MAX },
+                cumulative_count: cum,
+            })
+            .collect(),
+    )
+}
+
+/// A histogram's mean in milliseconds, from its `_sum` and `_count` in
+/// seconds. `None` until the histogram has an observation, so the tile stays
+/// blank rather than reading zero.
+pub(crate) fn mean_ms(sum: Option<f64>, count: Option<f64>) -> Option<f64> {
+    match (sum, count) {
+        (Some(s), Some(c)) if c > 0.0 => Some((s / c) * 1000.0),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

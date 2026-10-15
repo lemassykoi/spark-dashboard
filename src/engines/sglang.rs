@@ -1,19 +1,16 @@
-use super::histogram::{fraction_le, percentile};
+use super::common::{warmup_skip_from_env, CounterRate, EngineHttp};
+use super::histogram::{goodput_pct, mean_ms, percentiles_ms, wire_buckets};
+use super::model_info::ModelResolver;
 use super::prometheus::{parse_prometheus_text, GaugeSeries, ParsedMetrics};
-use super::vllm::{
-    classify_models_error_status, fetch_hf_model_info, normalize_model_id, resolve_model_name,
-    ModelsEndpointReply, OpenAIModelsResponse,
-};
 use super::warmup::WarmupTracker;
 use super::{
-    EngineAdapter, EngineMetrics, EngineStatus, EngineType, HistogramBucket, LatencyPercentiles,
-    MetricGroup, ModelInfo, ModelMetadataError, ModelResolution, E2E_SLO_MS, ITL_SLO_MS,
-    TTFT_SLO_MS,
+    EngineAdapter, EngineMetrics, EngineStatus, EngineType, MetricGroup, ModelResolution,
+    E2E_SLO_MS, ITL_SLO_MS, TTFT_SLO_MS,
 };
 use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 /// The launch flag that turns SGLang's `/metrics` endpoint on. Without it the
@@ -26,33 +23,21 @@ pub const METRICS_LAUNCH_FLAG: &str = "--enable-metrics";
 /// adds one observation to the time-to-first-token histogram, as on vLLM.
 const WARMUP_TRIGGER_KEY: &str = "sglang_time_to_first_token_seconds_count";
 
-/// Read the warmup-skip threshold from the environment, shared convention
-/// with the vLLM adapter (`SPARK_WARMUP_SKIP_REQUESTS`).
-fn warmup_skip_from_env() -> u64 {
-    std::env::var("SPARK_WARMUP_SKIP_REQUESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1)
-}
-
 pub struct SglangAdapter {
-    client: reqwest::Client,
-    endpoint: String,
-    /// Optional bearer token. SGLang gates `/v1/models` (and everything
-    /// except `/health`, `/ready`, `/metrics`) when launched with an API key;
-    /// the open endpoints ignore a presented token harmlessly.
-    api_key: Option<String>,
-    /// Model identity recovered from the launch command line
-    /// (`--model-path` / `--served-model-name`), the same fallback role it
-    /// plays in the vLLM adapter.
-    served_model: Option<String>,
-    prev_gen_tokens: Mutex<Option<(f64, Instant)>>,
-    prev_prompt_tokens: Mutex<Option<(f64, Instant)>>,
-    avg_accum: Mutex<(f64, u64)>,
-    avg_prompt_accum: Mutex<(f64, u64)>,
+    /// The endpoint, and the bearer token of a launch with `--api-key`.
+    /// SGLang gates `/v1/models` (and everything except `/health`, `/ready`,
+    /// `/metrics`) with it; the open routes ignore a presented token
+    /// harmlessly.
+    http: EngineHttp,
+    /// Model identity: `/v1/models`, the command-line hint
+    /// (`--model-path` / `--served-model-name`), HF enrichment — shared with
+    /// the vLLM adapter, since SGLang's `/v1/models` answers identically.
+    model: ModelResolver,
+    /// Generation tokens/s and its running average.
+    gen_rate: Mutex<CounterRate>,
+    /// Prompt tokens/s and its running average.
+    prompt_rate: Mutex<CounterRate>,
     warmup: Mutex<WarmupTracker>,
-    hf_model_cache: Mutex<Option<ModelInfo>>,
-    last_hf_error: Mutex<Option<Instant>>,
     /// Latched by each metrics scrape: true when `/metrics` answered 404 (the
     /// launch without `--enable-metrics`, which never mounts the route),
     /// false when it answered at all. A scrape that could not reach the
@@ -69,28 +54,15 @@ impl SglangAdapter {
         api_key: Option<String>,
     ) -> Self {
         Self {
-            client,
-            endpoint,
-            api_key,
-            served_model,
-            prev_gen_tokens: Mutex::new(None),
-            prev_prompt_tokens: Mutex::new(None),
-            avg_accum: Mutex::new((0.0, 0)),
-            avg_prompt_accum: Mutex::new((0.0, 0)),
+            http: EngineHttp::new(client, endpoint, api_key),
+            model: ModelResolver::new(served_model),
+            gen_rate: Mutex::default(),
+            prompt_rate: Mutex::default(),
             warmup: Mutex::new(WarmupTracker::new(
                 warmup_skip_from_env(),
                 WARMUP_TRIGGER_KEY,
             )),
-            hf_model_cache: Mutex::new(None),
-            last_hf_error: Mutex::new(None),
             metrics_off: AtomicBool::new(false),
-        }
-    }
-
-    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.api_key {
-            Some(key) => rb.bearer_auth(key),
-            None => rb,
         }
     }
 }
@@ -163,7 +135,7 @@ impl EngineAdapter for SglangAdapter {
     }
 
     fn endpoint(&self) -> &str {
-        &self.endpoint
+        self.http.endpoint()
     }
 
     /// SGLang reports every group its endpoint can fill; fields a given
@@ -189,95 +161,15 @@ impl EngineAdapter for SglangAdapter {
         // runs a one-token generation through the scheduler, so it stalls for
         // as long as the queue ahead of it — a live but busy engine would
         // read as failing health under exactly the load that matters.
-        match self
-            .auth(
-                self.client
-                    .get(format!("{}/ready", self.endpoint))
-                    .timeout(Duration::from_secs(2)),
-            )
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => EngineStatus::Running,
-            Ok(r) => EngineStatus::Error(format!("HTTP {}", r.status())),
-            Err(e) => EngineStatus::Error(e.to_string()),
-        }
+        self.http.health("/ready").await
     }
 
     async fn get_model_info(&self) -> ModelResolution {
-        // Same OpenAI-compatible endpoint and the same precedence and error
-        // classification the vLLM adapter uses (shared helpers in `vllm.rs`),
-        // because SGLang's `/v1/models` answers identically — including the
-        // 401 when the engine has an API key the dashboard was not given.
-        let reply = match self
-            .auth(
-                self.client
-                    .get(format!("{}/v1/models", self.endpoint))
-                    .timeout(Duration::from_secs(2)),
-            )
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<OpenAIModelsResponse>().await {
-                    Ok(models) => match models.data.first() {
-                        Some(m) => ModelsEndpointReply::Resolved(m.id.clone()),
-                        None => ModelsEndpointReply::Empty,
-                    },
-                    Err(_) => ModelsEndpointReply::Failed(ModelMetadataError::Unavailable),
-                }
-            }
-            Ok(resp) => {
-                ModelsEndpointReply::Failed(classify_models_error_status(resp.status().as_u16()))
-            }
-            Err(_) => ModelsEndpointReply::Failed(ModelMetadataError::Unavailable),
-        };
-
-        let (name, metadata_error) = resolve_model_name(&reply, self.served_model.as_deref());
-        let Some(name) = name else {
-            return ModelResolution {
-                model: None,
-                metadata_error,
-            };
-        };
-
-        let name = normalize_model_id(&name);
-        let model = match fetch_hf_model_info(
-            &self.endpoint,
-            &name,
-            &self.hf_model_cache,
-            &self.last_hf_error,
-        )
-        .await
-        {
-            Some(enriched) => enriched,
-            None => ModelInfo {
-                name,
-                parameter_size: None,
-                quantization: None,
-                precision: None,
-                tensor_type: None,
-                model_type: None,
-                pipeline_tag: None,
-            },
-        };
-
-        ModelResolution {
-            model: Some(model),
-            metadata_error,
-        }
+        self.model.resolve(&self.http).await
     }
 
     async fn get_metrics(&self) -> Option<EngineMetrics> {
-        let resp = self
-            .auth(
-                self.client
-                    .get(format!("{}/metrics", self.endpoint))
-                    .timeout(Duration::from_secs(2)),
-            )
-            .send()
-            .await
-            .ok()?;
+        let resp = self.http.get("/metrics").send().await.ok()?;
         let status = resp.status();
         let body = resp.text().await.ok()?;
         // The latch decision is `metrics_off_signal`, pure below so the ways
@@ -299,12 +191,10 @@ impl EngineAdapter for SglangAdapter {
             tracker.observe(&raw)
         };
         if warmup_out.just_transitioned {
-            *self.prev_gen_tokens.lock().await = None;
-            *self.prev_prompt_tokens.lock().await = None;
-            *self.avg_accum.lock().await = (0.0, 0);
-            *self.avg_prompt_accum.lock().await = (0.0, 0);
+            self.gen_rate.lock().await.reset();
+            self.prompt_rate.lock().await.reset();
             tracing::info!(
-                endpoint = %self.endpoint,
+                endpoint = %self.http.endpoint(),
                 "warmup complete — baseline captured, steady-state metrics now reported"
             );
         }
@@ -315,72 +205,10 @@ impl EngineAdapter for SglangAdapter {
         let current_gen = counter("sglang_generation_tokens_total");
         let current_prompt = counter("sglang_prompt_tokens_total");
         let now = Instant::now();
-        let tokens_per_sec = {
-            let mut prev_lock = self.prev_gen_tokens.lock().await;
-            let tps = match (current_gen, prev_lock.as_ref()) {
-                (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(val) = current_gen {
-                *prev_lock = Some((val, now));
-            }
-            tps
-        };
-
-        let prompt_tokens_per_sec = {
-            let mut prev_lock = self.prev_prompt_tokens.lock().await;
-            let tps = match (current_prompt, prev_lock.as_ref()) {
-                (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(val) = current_prompt {
-                *prev_lock = Some((val, now));
-            }
-            tps
-        };
-
-        let avg_tokens_per_sec = {
-            let mut accum = self.avg_accum.lock().await;
-            if let Some(tps) = tokens_per_sec {
-                if tps > 0.0 {
-                    accum.0 += tps;
-                    accum.1 += 1;
-                }
-            }
-            if accum.1 > 0 {
-                Some(accum.0 / accum.1 as f64)
-            } else {
-                None
-            }
-        };
-        let avg_prompt_tokens_per_sec = {
-            let mut accum = self.avg_prompt_accum.lock().await;
-            if let Some(tps) = prompt_tokens_per_sec {
-                if tps > 0.0 {
-                    accum.0 += tps;
-                    accum.1 += 1;
-                }
-            }
-            if accum.1 > 0 {
-                Some(accum.0 / accum.1 as f64)
-            } else {
-                None
-            }
-        };
+        let (tokens_per_sec, avg_tokens_per_sec) =
+            self.gen_rate.lock().await.observe(current_gen, now);
+        let (prompt_tokens_per_sec, avg_prompt_tokens_per_sec) =
+            self.prompt_rate.lock().await.observe(current_prompt, now);
 
         Some(engine_metrics(
             parsed,
@@ -462,23 +290,19 @@ fn engine_metrics(
         .or_else(|| parsed.gauge_mean("sglang_token_usage"))
         .map(|v| v * 100.0);
 
-    let avg_ms = |sum: Option<f64>, count: Option<f64>| match (sum, count) {
-        (Some(s), Some(c)) if c > 0.0 => Some((s / c) * 1000.0),
-        _ => None,
-    };
-    let ttft_ms = avg_ms(
+    let ttft_ms = mean_ms(
         counter("sglang_time_to_first_token_seconds_sum"),
         counter("sglang_time_to_first_token_seconds_count"),
     );
-    let e2e_latency_ms = avg_ms(
+    let e2e_latency_ms = mean_ms(
         counter("sglang_e2e_request_latency_seconds_sum"),
         counter("sglang_e2e_request_latency_seconds_count"),
     );
-    let queue_time_ms = avg_ms(
+    let queue_time_ms = mean_ms(
         counter("sglang_queue_time_seconds_sum"),
         counter("sglang_queue_time_seconds_count"),
     );
-    let inter_token_latency_ms = avg_ms(
+    let inter_token_latency_ms = mean_ms(
         counter("sglang_inter_token_latency_seconds_sum"),
         counter("sglang_inter_token_latency_seconds_count"),
     );
@@ -532,49 +356,17 @@ fn engine_metrics(
     let spec_decode_acceptance_rate = acceptance.and_then(|(_, rate)| rate).map(|v| v * 100.0);
 
     // Percentiles, goodput and shipped buckets from the request-level
-    // histograms. Identical math to the vLLM adapter — SGLang's buckets
-    // are plain cumulative histograms in seconds.
-    let percentiles_ms = |metric: &str| -> Option<LatencyPercentiles> {
-        let buckets = parsed.histograms.get(metric)?;
-        let to_ms = |q: f64| percentile(buckets, q).map(|s| s * 1000.0);
-        let p = LatencyPercentiles {
-            p50_ms: to_ms(0.50),
-            p95_ms: to_ms(0.95),
-            p99_ms: to_ms(0.99),
-        };
-        if p.p50_ms.is_none() && p.p95_ms.is_none() && p.p99_ms.is_none() {
-            None
-        } else {
-            Some(p)
-        }
-    };
-    let goodput_pct = |metric: &str, slo_ms: f64| -> Option<f64> {
-        let buckets = parsed.histograms.get(metric)?;
-        fraction_le(buckets, slo_ms / 1000.0).map(|f| f * 100.0)
-    };
-    let buckets_for = |metric: &str| -> Option<Vec<HistogramBucket>> {
-        let raw = parsed.histograms.get(metric)?;
-        if raw.is_empty() {
-            return None;
-        }
-        Some(
-            raw.iter()
-                .map(|&(le, cum)| HistogramBucket {
-                    le_seconds: if le.is_finite() { le } else { f64::MAX },
-                    cumulative_count: cum,
-                })
-                .collect(),
-        )
-    };
-    let ttft_percentiles = percentiles_ms("sglang_time_to_first_token_seconds");
-    let itl_percentiles = percentiles_ms("sglang_inter_token_latency_seconds");
-    let e2e_percentiles = percentiles_ms("sglang_e2e_request_latency_seconds");
-    let ttft_goodput_pct = goodput_pct("sglang_time_to_first_token_seconds", TTFT_SLO_MS);
-    let itl_goodput_pct = goodput_pct("sglang_inter_token_latency_seconds", ITL_SLO_MS);
-    let e2e_goodput_pct = goodput_pct("sglang_e2e_request_latency_seconds", E2E_SLO_MS);
-    let ttft_buckets = buckets_for("sglang_time_to_first_token_seconds");
-    let itl_buckets = buckets_for("sglang_inter_token_latency_seconds");
-    let e2e_buckets = buckets_for("sglang_e2e_request_latency_seconds");
+    // histograms, through the same helpers as the vLLM adapter — SGLang's
+    // buckets are plain cumulative histograms in seconds.
+    let ttft_percentiles = percentiles_ms(parsed, "sglang_time_to_first_token_seconds");
+    let itl_percentiles = percentiles_ms(parsed, "sglang_inter_token_latency_seconds");
+    let e2e_percentiles = percentiles_ms(parsed, "sglang_e2e_request_latency_seconds");
+    let ttft_goodput_pct = goodput_pct(parsed, "sglang_time_to_first_token_seconds", TTFT_SLO_MS);
+    let itl_goodput_pct = goodput_pct(parsed, "sglang_inter_token_latency_seconds", ITL_SLO_MS);
+    let e2e_goodput_pct = goodput_pct(parsed, "sglang_e2e_request_latency_seconds", E2E_SLO_MS);
+    let ttft_buckets = wire_buckets(parsed, "sglang_time_to_first_token_seconds");
+    let itl_buckets = wire_buckets(parsed, "sglang_inter_token_latency_seconds");
+    let e2e_buckets = wire_buckets(parsed, "sglang_e2e_request_latency_seconds");
 
     // Fields SGLang does not report at all (ADR-0004 — absent series are
     // not reported, never proxied by a stand-in): TPOT has no histogram
@@ -643,6 +435,7 @@ fn engine_metrics(
 
 #[cfg(test)]
 mod tests {
+    use super::super::histogram::percentile;
     use super::*;
 
     /// A scrape of a real SGLang v0.5.2x (qwen4-main nightly) on a GB10,
@@ -1096,5 +889,61 @@ sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",role=\"decode\"} 4
         assert_eq!(third.total_requests, Some(7));
         assert!(third.tokens_per_sec.is_some_and(|tps| tps > 0.0));
         assert!(third.ttft_ms.is_some_and(|ms| ms > 0.0));
+    }
+
+    /// SGLang's model identity goes through the resolver vLLM uses, so an
+    /// API-key launch the dashboard holds no key for is reported the same
+    /// way: the command-line name as a fallback, `AuthRequired` beside it,
+    /// and the warning that tells the operator to configure a provider API
+    /// key — which the adapter's own copy of the code had dropped.
+    #[tokio::test]
+    async fn an_unauthorized_models_route_warns_like_vllm() {
+        use super::super::test_server::TestServer;
+        use super::super::ModelMetadataError;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let server = TestServer::start(|_| (401, "Unauthorized".into())).await;
+        let adapter = SglangAdapter::new(
+            reqwest::Client::new(),
+            server.url.clone(),
+            // Not an `org/name` id, so HF enrichment never leaves the host.
+            Some("qwen3-local".into()),
+            None,
+        );
+        let resolution = adapter.get_model_info().await;
+
+        assert_eq!(
+            resolution.metadata_error,
+            Some(ModelMetadataError::AuthRequired)
+        );
+        assert_eq!(
+            resolution.model.map(|m| m.name).as_deref(),
+            Some("qwen3-local")
+        );
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("configure a provider API key"),
+            "warning logged: {logged}"
+        );
     }
 }

@@ -1,114 +1,40 @@
-use super::histogram::{fraction_le, percentile};
+use super::common::{warmup_skip_from_env, CounterRate, EngineHttp};
+use super::histogram::{goodput_pct, mean_ms, percentiles_ms, wire_buckets};
+use super::model_info::ModelResolver;
 use super::prometheus::parse_prometheus_text;
 use super::warmup::WarmupTracker;
 use super::{
-    EngineAdapter, EngineMetrics, EngineStatus, EngineType, HistogramBucket, LatencyPercentiles,
-    MetricGroup, ModelInfo, ModelMetadataError, ModelResolution, E2E_SLO_MS, ITL_SLO_MS,
-    TPOT_SLO_MS, TTFT_SLO_MS,
+    EngineAdapter, EngineMetrics, EngineStatus, EngineType, MetricGroup, ModelResolution,
+    E2E_SLO_MS, ITL_SLO_MS, TPOT_SLO_MS, TTFT_SLO_MS,
 };
 use async_trait::async_trait;
-use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
-
-/// Default number of requests to skip on engine startup before baselining.
-/// vLLM's first inference is dominated by CUDA kernel JIT and KV cache
-/// allocation; excluding one request consistently removes the outlier.
-const DEFAULT_WARMUP_SKIP_REQUESTS: u64 = 1;
 
 /// The request counter warmup progress is measured on: every vLLM request
 /// adds one observation to the time-to-first-token histogram.
 const WARMUP_TRIGGER_KEY: &str = "vllm_time_to_first_token_seconds_count";
 
-/// Read the warmup-skip threshold from the environment. Falls back silently
-/// to the default on parse failure or when the variable is unset.
-fn warmup_skip_from_env() -> u64 {
-    std::env::var("SPARK_WARMUP_SKIP_REQUESTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_WARMUP_SKIP_REQUESTS)
-}
-
-/// Format a raw parameter count into a compact human-readable string.
-fn format_param_size(count: u64) -> String {
-    if count >= 1_000_000_000 {
-        format!("{:.1}B params", count as f64 / 1_000_000_000.0)
-    } else if count >= 1_000_000 {
-        format!("{:.1}M params", count as f64 / 1_000_000.0)
-    } else {
-        format!("{} params", count)
-    }
-}
-
-/// Format quantization method name into a human-readable label.
-fn format_quant_method(method: &str) -> String {
-    match method {
-        "auto-round" => "AutoRound".into(),
-        "gptq" => "GPTQ".into(),
-        "awq" => "AWQ".into(),
-        "bitsandbytes" => "BitsAndBytes".into(),
-        "fp8" => "FP8".into(),
-        other => other.to_string(),
-    }
-}
-
-/// Format quantization bits into a precision label.
-fn format_precision(bits: u64) -> String {
-    format!("{}-bit precision", bits)
-}
-
-/// Format the primary tensor dtype from safetensors parameter keys.
-/// Picks the key with the largest parameter count, excluding integer
-/// storage formats that represent packed quantized weights.
-fn format_tensor_type(params: &std::collections::HashMap<String, u64>) -> Option<String> {
-    // Prefer float dtypes over integer storage formats.
-    let float_keys: [&str; 5] = ["BF16", "F16", "F32", "F64", "FP8"];
-    for key in &float_keys {
-        if params.contains_key(*key) {
-            return Some(key.to_string());
-        }
-    }
-    params.keys().next().cloned()
-}
-
 pub struct VllmAdapter {
-    client: reqwest::Client,
-    endpoint: String,
-    /// Optional bearer token for auth-gated deployments (vLLM `--api-key`).
-    /// Applied to engine requests; open endpoints (`/health`, `/metrics`)
-    /// ignore it harmlessly. The HuggingFace request is never authenticated
-    /// with it.
-    api_key: Option<String>,
-    /// Model identity recovered from the launch command line (e.g.
-    /// `unsloth/Llama-3.2-1B-Instruct`). Used as a fallback when
-    /// `/v1/models` returns a bare slug without the HF-style `Provider/`
-    /// prefix — see `get_model_info` for the precedence rules.
-    served_model: Option<String>,
-    /// Previous generation_tokens_total counter reading for rate computation.
-    prev_gen_tokens: Mutex<Option<(f64, Instant)>>,
-    /// Previous prompt_tokens_total counter reading for rate computation.
-    prev_prompt_tokens: Mutex<Option<(f64, Instant)>>,
+    /// The endpoint, and the bearer token of an auth-gated deployment
+    /// (vLLM `--api-key`), applied to every engine request.
+    http: EngineHttp,
+    /// Model identity: `/v1/models`, the command-line hint, HF enrichment.
+    model: ModelResolver,
+    /// Generation tokens/s and its running average, from the
+    /// generation_tokens_total counter.
+    gen_rate: Mutex<CounterRate>,
+    /// Prompt tokens/s and its running average, from prompt_tokens_total.
+    prompt_rate: Mutex<CounterRate>,
     /// Previous (accepted, draft) spec-decode counter readings, used to compute
     /// the live (windowed) token acceptance rate from per-poll deltas. No
     /// timestamp is stored because the live TAR is a unit-free ratio of deltas.
     prev_spec_decode: Mutex<Option<(f64, f64)>>,
-    /// Running average for generation: (sum_of_tps_readings, count_of_readings)
-    avg_accum: Mutex<(f64, u64)>,
-    /// Running average for prompt: (sum_of_tps_readings, count_of_readings)
-    avg_prompt_accum: Mutex<(f64, u64)>,
     /// Warmup baseline tracker — drops the first `SPARK_WARMUP_SKIP_REQUESTS`
     /// observations from histogram-derived metrics so the slow first inference
     /// does not skew steady-state percentiles and averages.
     warmup: Mutex<WarmupTracker>,
-    /// Cached HuggingFace model metadata. Once successfully fetched, this
-    /// lives for the lifetime of the adapter (model params and quantization
-    /// do not change at runtime).
-    hf_model_cache: Mutex<Option<ModelInfo>>,
-    /// Wall-clock time of the most recent failed HF API attempt. Used to
-    /// enforce a cooldown so a transient HF outage does not trigger a
-    /// request on every 1-second poll cycle.
-    last_hf_error: Mutex<Option<Instant>>,
 }
 
 impl VllmAdapter {
@@ -119,349 +45,17 @@ impl VllmAdapter {
         api_key: Option<String>,
     ) -> Self {
         Self {
-            client,
-            endpoint,
-            api_key,
-            served_model,
-            prev_gen_tokens: Mutex::new(None),
-            prev_prompt_tokens: Mutex::new(None),
+            http: EngineHttp::new(client, endpoint, api_key),
+            model: ModelResolver::new(served_model),
+            gen_rate: Mutex::default(),
+            prompt_rate: Mutex::default(),
             prev_spec_decode: Mutex::new(None),
-            avg_accum: Mutex::new((0.0, 0)),
-            avg_prompt_accum: Mutex::new((0.0, 0)),
             warmup: Mutex::new(WarmupTracker::new(
                 warmup_skip_from_env(),
                 WARMUP_TRIGGER_KEY,
             )),
-            hf_model_cache: Mutex::new(None),
-            last_hf_error: Mutex::new(None),
         }
     }
-
-    /// Attach the bearer token when one is configured. No-op otherwise, so
-    /// open `/health` and `/metrics` endpoints are unaffected.
-    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.api_key {
-            Some(key) => rb.bearer_auth(key),
-            None => rb,
-        }
-    }
-
-    /// Cooldown and caching live in `fetch_hf_model_info` (shared with the
-    /// SGLang adapter); this is the endpoint-scoped view of it.
-    async fn fetch_hf_model_info(&self, model_id: &str) -> Option<ModelInfo> {
-        fetch_hf_model_info(
-            &self.endpoint,
-            model_id,
-            &self.hf_model_cache,
-            &self.last_hf_error,
-        )
-        .await
-    }
-}
-
-/// Cooldown between HF API retries after a failed request.
-const HF_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
-
-/// Fetch model metadata from the HuggingFace model-info API.
-///
-/// Uses an internal cache so the API is called at most once per engine
-/// lifetime. On failure, a 60-second cooldown prevents hammering the HF
-/// API on every 1-second poll cycle.
-pub(crate) async fn fetch_hf_model_info(
-    endpoint: &str,
-    model_id: &str,
-    cache: &Mutex<Option<ModelInfo>>,
-    last_error: &Mutex<Option<Instant>>,
-) -> Option<ModelInfo> {
-    // Cache hit — model metadata never changes at runtime. Only for the
-    // same id, though: the name can legitimately change once, when an
-    // auth-gated `/v1/models` starts answering and replaces the
-    // command-line fallback the cache was filled from. A stale entry
-    // must not keep renaming the model back.
-    {
-        let cache = cache.lock().await;
-        if let Some(cached) = cache.as_ref() {
-            if cached.name == model_id {
-                return Some(cached.clone());
-            }
-        }
-    }
-
-    // Cooldown check — don't retry on every 1-second poll.
-    {
-        let last = last_error.lock().await;
-        if let Some(when) = *last {
-            if when.elapsed() < HF_RETRY_COOLDOWN {
-                return None;
-            }
-        }
-    }
-
-    // Only HF-format names can be resolved — bare serve names have no
-    // `org/name` shape, and a filesystem path (a local-directory launch
-    // that `normalize_model_id` could not map back to a repo id) is not
-    // an HF repo either.
-    if !model_id.contains('/') || model_id.starts_with(['/', '.', '~']) {
-        return None;
-    }
-
-    let url = format!("https://huggingface.co/api/models/{}", model_id);
-
-    let hf_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
-
-    let resp = match hf_client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            let status = r.status();
-            if is_expected_hf_miss(status.as_u16()) {
-                // Not a public HF repo (local/custom serve name or gated
-                // model without a token) — expected, enrichment is optional.
-                tracing::debug!(
-                    endpoint = %endpoint,
-                    model_id = %model_id,
-                    status = %status,
-                    "HF model info unavailable (model not public on HuggingFace); skipping enrichment",
-                );
-            } else {
-                tracing::warn!(
-                    endpoint = %endpoint,
-                    model_id = %model_id,
-                    status = %status,
-                    "HF model info API returned non-success",
-                );
-            }
-            *last_error.lock().await = Some(Instant::now());
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!(
-                endpoint = %endpoint,
-                model_id = %model_id,
-                error = %e,
-                "HF model info API request failed",
-            );
-            *last_error.lock().await = Some(Instant::now());
-            return None;
-        }
-    };
-
-    let hf: HfModelResponse = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                endpoint = %endpoint,
-                model_id = %model_id,
-                error = %e,
-                "HF model info response deserialization failed",
-            );
-            *last_error.lock().await = Some(Instant::now());
-            return None;
-        }
-    };
-
-    let parameter_size = hf
-        .safetensors
-        .as_ref()
-        .and_then(|s| s.total)
-        .map(format_param_size);
-
-    let quant_config = hf
-        .config
-        .as_ref()
-        .and_then(|c| c.quantization_config.as_ref());
-
-    let quantization = quant_config
-        .and_then(|q| q.quant_method.as_deref())
-        .map(format_quant_method);
-
-    let precision = quant_config.and_then(|q| q.bits).map(format_precision);
-
-    let tensor_type = hf
-        .safetensors
-        .as_ref()
-        .and_then(|s| s.parameters.as_ref())
-        .and_then(format_tensor_type);
-
-    let model_type = hf.config.as_ref().and_then(|c| c.model_type.clone());
-
-    let result = ModelInfo {
-        name: model_id.to_string(),
-        parameter_size,
-        quantization,
-        precision,
-        tensor_type,
-        model_type,
-        pipeline_tag: hf.pipeline_tag,
-    };
-
-    *cache.lock().await = Some(result.clone());
-
-    tracing::info!(
-        endpoint = %endpoint,
-        model_id = %model_id,
-        parameter_size = ?result.parameter_size,
-        quantization = ?result.quantization,
-        precision = ?result.precision,
-        tensor_type = ?result.tensor_type,
-        model_type = ?result.model_type,
-        pipeline_tag = ?result.pipeline_tag,
-        "Fetched model info from HuggingFace",
-    );
-
-    Some(result)
-}
-
-/// Recover a human-readable model id from a filesystem path.
-///
-/// vLLM launched against a local directory (the `HF_HUB_OFFLINE` workflow)
-/// reports that path as its model id — typically a hub-cache snapshot like
-/// `~/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/<commit>`,
-/// whose last segment is a bare git commit hash and would end up displayed
-/// as the model name.
-///
-/// * A path containing a hub-cache `models--{org}--{name}` segment is
-///   de-mangled back to `org/name`. Splitting on `--` is unambiguous: the
-///   hub encodes the one `/` of a repo id as `--`, and HuggingFace forbids
-///   consecutive dashes inside org and repo names.
-/// * Otherwise a trailing `snapshots/<commit-hash>` is dropped, so the
-///   display name falls back to the containing directory instead of the hash.
-/// * Anything else — HF ids, custom serve names, plain paths — passes
-///   through unchanged.
-pub(crate) fn normalize_model_id(id: &str) -> String {
-    if !id.contains('/') {
-        return id.to_string();
-    }
-
-    for segment in id.split('/') {
-        if let Some(repo) = segment.strip_prefix("models--") {
-            if let Some((org, name)) = repo.split_once("--") {
-                if !org.is_empty() && !name.is_empty() {
-                    return format!("{org}/{name}");
-                }
-            }
-        }
-    }
-
-    let trimmed = id.trim_end_matches('/');
-    if let Some((parent, last)) = trimmed.rsplit_once('/') {
-        let is_commit_hash = last.len() == 40 && last.bytes().all(|b| b.is_ascii_hexdigit());
-        if is_commit_hash {
-            if let Some((grandparent, "snapshots")) = parent.rsplit_once('/') {
-                if !grandparent.trim_matches('/').is_empty() {
-                    return grandparent.to_string();
-                }
-            }
-        }
-    }
-
-    id.to_string()
-}
-
-/// HuggingFace returns these statuses when a model id isn't publicly
-/// resolvable — local/custom serve names (e.g. a vLLM `--served-model-name`),
-/// or gated/private repos accessed without a token. Metadata enrichment is
-/// best-effort, so these are expected and logged at debug rather than warn.
-pub(crate) fn is_expected_hf_miss(status: u16) -> bool {
-    matches!(status, 401 | 403 | 404)
-}
-
-/// What the engine's `/v1/models` endpoint had to say, reduced to the cases
-/// the name resolution cares about.
-pub(crate) enum ModelsEndpointReply {
-    /// A model id was returned.
-    Resolved(String),
-    /// The endpoint answered successfully but listed no models.
-    Empty,
-    /// The endpoint could not be read; the error says why.
-    Failed(ModelMetadataError),
-}
-
-/// Classify a non-success `/v1/models` status. 401/403 mean the dashboard
-/// lacks the engine's API key — the one failure an operator fixes on the
-/// dashboard's side (configure a provider API key), so it gets its own
-/// reason; everything else is generic unavailability.
-pub(crate) fn classify_models_error_status(status: u16) -> ModelMetadataError {
-    match status {
-        401 | 403 => ModelMetadataError::AuthRequired,
-        _ => ModelMetadataError::Unavailable,
-    }
-}
-
-/// Resolve the display name from the `/v1/models` reply and the command-line
-/// hint, and say why the engine's own answer is missing when it is.
-///
-/// Precedence on a successful reply (unchanged from before the error
-/// plumbing):
-///   1. API id, if it already carries a `Provider/` prefix.
-///   2. Command-line hint captured during detection.
-///   3. API id as-is (bare slug).
-///   4. None (nothing resolved).
-///
-/// When the endpoint failed or listed nothing, the hint is all there is, and
-/// the metadata error travels with it — the fallback name is shown, but the
-/// frontend can say it is only a fallback.
-pub(crate) fn resolve_model_name(
-    reply: &ModelsEndpointReply,
-    hint: Option<&str>,
-) -> (Option<String>, Option<ModelMetadataError>) {
-    match reply {
-        ModelsEndpointReply::Resolved(id) => {
-            let name = if id.contains('/') {
-                id.clone()
-            } else {
-                hint.map(str::to_string).unwrap_or_else(|| id.clone())
-            };
-            (Some(name), None)
-        }
-        ModelsEndpointReply::Empty => (
-            hint.map(str::to_string),
-            Some(ModelMetadataError::Unavailable),
-        ),
-        ModelsEndpointReply::Failed(error) => (hint.map(str::to_string), Some(*error)),
-    }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct OpenAIModelsResponse {
-    #[serde(default)]
-    pub(crate) data: Vec<OpenAIModel>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct OpenAIModel {
-    pub(crate) id: String,
-}
-
-/// Response shape for GET https://huggingface.co/api/models/{model_id}
-#[derive(Deserialize)]
-pub(crate) struct HfModelResponse {
-    pipeline_tag: Option<String>,
-    safetensors: Option<HfSafetensors>,
-    #[serde(default)]
-    config: Option<HfConfig>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct HfSafetensors {
-    total: Option<u64>,
-    #[serde(default)]
-    parameters: Option<std::collections::HashMap<String, u64>>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct HfConfig {
-    #[serde(default)]
-    model_type: Option<String>,
-    quantization_config: Option<HfQuantizationConfig>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct HfQuantizationConfig {
-    bits: Option<u64>,
-    quant_method: Option<String>,
 }
 
 #[async_trait]
@@ -471,7 +65,7 @@ impl EngineAdapter for VllmAdapter {
     }
 
     fn endpoint(&self) -> &str {
-        &self.endpoint
+        self.http.endpoint()
     }
 
     /// vLLM reports every group. Speculative decoding included: the group says
@@ -483,126 +77,17 @@ impl EngineAdapter for VllmAdapter {
     }
 
     async fn health_check(&self) -> EngineStatus {
-        match self
-            .auth(
-                self.client
-                    .get(format!("{}/health", self.endpoint))
-                    .timeout(Duration::from_secs(2)),
-            )
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => EngineStatus::Running,
-            Ok(r) => EngineStatus::Error(format!("HTTP {}", r.status())),
-            Err(e) => EngineStatus::Error(e.to_string()),
-        }
+        self.http.health("/health").await
     }
 
     async fn get_model_info(&self) -> ModelResolution {
-        // Try the OpenAI-compatible models endpoint first. vLLM returns
-        // whatever id it was launched with, but downstream model routers can
-        // strip the HF-style `Provider/` prefix before replying — which is
-        // exactly the case we want to recover from via the command-line hint.
-        // The status is inspected rather than piped through "parse or None":
-        // an auth-gated deployment answers 401/403 here while `/metrics`
-        // keeps working, and that rejection must reach the operator instead
-        // of silently degrading to the command-line fallback (issue #90).
-        let reply = match self
-            .auth(
-                self.client
-                    .get(format!("{}/v1/models", self.endpoint))
-                    .timeout(Duration::from_secs(2)),
-            )
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<OpenAIModelsResponse>().await {
-                    Ok(models) => match models.data.first() {
-                        Some(m) => ModelsEndpointReply::Resolved(m.id.clone()),
-                        None => ModelsEndpointReply::Empty,
-                    },
-                    Err(e) => {
-                        tracing::debug!(
-                            endpoint = %self.endpoint,
-                            error = %e,
-                            "/v1/models response deserialization failed",
-                        );
-                        ModelsEndpointReply::Failed(ModelMetadataError::Unavailable)
-                    }
-                }
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let error = classify_models_error_status(status.as_u16());
-                if error == ModelMetadataError::AuthRequired {
-                    tracing::warn!(
-                        endpoint = %self.endpoint,
-                        status = %status,
-                        "/v1/models rejected the request as unauthorized — \
-                         configure a provider API key to read model metadata",
-                    );
-                } else {
-                    tracing::debug!(
-                        endpoint = %self.endpoint,
-                        status = %status,
-                        "/v1/models returned non-success",
-                    );
-                }
-                ModelsEndpointReply::Failed(error)
-            }
-            Err(e) => {
-                tracing::debug!(
-                    endpoint = %self.endpoint,
-                    error = %e,
-                    "/v1/models request failed",
-                );
-                ModelsEndpointReply::Failed(ModelMetadataError::Unavailable)
-            }
-        };
-
-        let (name, metadata_error) = resolve_model_name(&reply, self.served_model.as_deref());
-        let Some(name) = name else {
-            return ModelResolution {
-                model: None,
-                metadata_error,
-            };
-        };
-
-        // An offline launch (`HF_HUB_OFFLINE` + `--model <local dir>`) makes
-        // vLLM report the filesystem path as its model id. Recover the real
-        // repo id from the hub-cache layout so the UI never shows a snapshot
-        // commit hash as the model name.
-        let name = normalize_model_id(&name);
-
-        // Try HF enrichment — fetch_hf_model_info caches successes and
-        // throttles retries internally.
-        let model = match self.fetch_hf_model_info(&name).await {
-            Some(enriched) => enriched,
-            None => ModelInfo {
-                name,
-                parameter_size: None,
-                quantization: None,
-                precision: None,
-                tensor_type: None,
-                model_type: None,
-                pipeline_tag: None,
-            },
-        };
-
-        ModelResolution {
-            model: Some(model),
-            metadata_error,
-        }
+        self.model.resolve(&self.http).await
     }
 
     async fn get_metrics(&self) -> Option<EngineMetrics> {
         let body = self
-            .auth(
-                self.client
-                    .get(format!("{}/metrics", self.endpoint))
-                    .timeout(Duration::from_secs(2)),
-            )
+            .http
+            .get("/metrics")
             .send()
             .await
             .ok()?
@@ -629,13 +114,11 @@ impl EngineAdapter for VllmAdapter {
         // a hugely negative rate on the next tick. Reset everything that
         // depends on the previous reading before computing rates below.
         if warmup_out.just_transitioned {
-            *self.prev_gen_tokens.lock().await = None;
-            *self.prev_prompt_tokens.lock().await = None;
+            self.gen_rate.lock().await.reset();
+            self.prompt_rate.lock().await.reset();
             *self.prev_spec_decode.lock().await = None;
-            *self.avg_accum.lock().await = (0.0, 0);
-            *self.avg_prompt_accum.lock().await = (0.0, 0);
             tracing::info!(
-                endpoint = %self.endpoint,
+                endpoint = %self.http.endpoint(),
                 "warmup complete — baseline captured, steady-state metrics now reported"
             );
         }
@@ -659,17 +142,13 @@ impl EngineAdapter for VllmAdapter {
             .or_else(|| parsed.gauge_mean("vllm_gpu_cache_usage_perc"))
             .map(|v| v * 100.0);
 
+        let counter = |name: &str| parsed.counters.get(name).copied();
+
         // TTFT from histogram sum/count (average)
-        let ttft_count = parsed
-            .counters
-            .get("vllm_time_to_first_token_seconds_count");
-        let ttft_ms = {
-            let sum = parsed.counters.get("vllm_time_to_first_token_seconds_sum");
-            match (sum, ttft_count) {
-                (Some(&s), Some(&c)) if c > 0.0 => Some((s / c) * 1000.0),
-                _ => None,
-            }
-        };
+        let ttft_ms = mean_ms(
+            counter("vllm_time_to_first_token_seconds_sum"),
+            counter("vllm_time_to_first_token_seconds_count"),
+        );
 
         // total_requests is a pass-through display field — show the engine's
         // absolute lifetime request count, not the post-baseline delta. Read
@@ -705,82 +184,15 @@ impl EngineAdapter for VllmAdapter {
             }
         };
 
-        // TPS from generation_tokens_total counter (rate = delta / elapsed)
-        let current_gen = parsed.counters.get("vllm_generation_tokens_total").copied();
+        // Token rates from the generation and prompt counters (delta /
+        // elapsed), each with the running mean of its nonzero readings.
+        let current_gen = counter("vllm_generation_tokens_total");
+        let current_prompt = counter("vllm_prompt_tokens_total");
         let now = Instant::now();
-
-        let tokens_per_sec = {
-            let mut prev_lock = self.prev_gen_tokens.lock().await;
-            let tps = match (current_gen, prev_lock.as_ref()) {
-                (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(val) = current_gen {
-                *prev_lock = Some((val, now));
-            }
-            tps
-        };
-
-        // Prompt tokens/sec from prompt_tokens_total counter (rate = delta / elapsed)
-        let current_prompt = parsed.counters.get("vllm_prompt_tokens_total").copied();
-        let prompt_tokens_per_sec = {
-            let mut prev_lock = self.prev_prompt_tokens.lock().await;
-            let tps = match (current_prompt, prev_lock.as_ref()) {
-                (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(val) = current_prompt {
-                *prev_lock = Some((val, now));
-            }
-            tps
-        };
-
-        // Avg TPS = sum of non-zero TPS readings / count of readings.
-        // Only accumulates when there's actual throughput. Stays stable when idle.
-        let avg_tokens_per_sec = {
-            let mut accum = self.avg_accum.lock().await;
-            if let Some(tps) = tokens_per_sec {
-                if tps > 0.0 {
-                    accum.0 += tps;
-                    accum.1 += 1;
-                }
-            }
-            if accum.1 > 0 {
-                Some(accum.0 / accum.1 as f64)
-            } else {
-                None
-            }
-        };
-
-        // Avg prompt TPS (same pattern as generation avg)
-        let avg_prompt_tokens_per_sec = {
-            let mut accum = self.avg_prompt_accum.lock().await;
-            if let Some(tps) = prompt_tokens_per_sec {
-                if tps > 0.0 {
-                    accum.0 += tps;
-                    accum.1 += 1;
-                }
-            }
-            if accum.1 > 0 {
-                Some(accum.0 / accum.1 as f64)
-            } else {
-                None
-            }
-        };
+        let (tokens_per_sec, avg_tokens_per_sec) =
+            self.gen_rate.lock().await.observe(current_gen, now);
+        let (prompt_tokens_per_sec, avg_prompt_tokens_per_sec) =
+            self.prompt_rate.lock().await.observe(current_prompt, now);
 
         // Per-request prompt TPS: prompt_tokens_total / ttft_total_seconds
         // Approximates average prefill throughput per request
@@ -796,16 +208,10 @@ impl EngineAdapter for VllmAdapter {
         // --- New metrics ---
 
         // End-to-end request latency (avg from histogram)
-        let e2e_latency_ms = {
-            let sum = parsed.counters.get("vllm_e2e_request_latency_seconds_sum");
-            let count = parsed
-                .counters
-                .get("vllm_e2e_request_latency_seconds_count");
-            match (sum, count) {
-                (Some(&s), Some(&c)) if c > 0.0 => Some((s / c) * 1000.0),
-                _ => None,
-            }
-        };
+        let e2e_latency_ms = mean_ms(
+            counter("vllm_e2e_request_latency_seconds_sum"),
+            counter("vllm_e2e_request_latency_seconds_count"),
+        );
 
         // Swapped requests (memory pressure indicator)
         let swapped_requests = parsed
@@ -834,14 +240,10 @@ impl EngineAdapter for VllmAdapter {
             .map(|&q| q as u64);
 
         // Average queue wait time (from histogram)
-        let queue_time_ms = {
-            let sum = parsed.counters.get("vllm_request_queue_time_seconds_sum");
-            let count = parsed.counters.get("vllm_request_queue_time_seconds_count");
-            match (sum, count) {
-                (Some(&s), Some(&c)) if c > 0.0 => Some((s / c) * 1000.0),
-                _ => None,
-            }
-        };
+        let queue_time_ms = mean_ms(
+            counter("vllm_request_queue_time_seconds_sum"),
+            counter("vllm_request_queue_time_seconds_count"),
+        );
 
         // Total preemptions — pass-through display field, read absolute value
         // from `raw` so the lifetime count stays continuous across baselining.
@@ -918,104 +320,35 @@ impl EngineAdapter for VllmAdapter {
         // Average inter-token latency during decode (from histogram).
         // Guard against count == 0 so the tile stays blank until the engine
         // has streamed at least one inter-token gap.
-        let inter_token_latency_ms = {
-            let sum = parsed.counters.get("vllm_inter_token_latency_seconds_sum");
-            let count = parsed
-                .counters
-                .get("vllm_inter_token_latency_seconds_count");
-            match (sum, count) {
-                (Some(&s), Some(&c)) if c > 0.0 => Some((s / c) * 1000.0),
-                _ => None,
-            }
-        };
+        let inter_token_latency_ms = mean_ms(
+            counter("vllm_inter_token_latency_seconds_sum"),
+            counter("vllm_inter_token_latency_seconds_count"),
+        );
 
         // Average time per output token during decode (from histogram
         // sum/count). vLLM v1 names it `request_time_per_output_token`;
         // v0.6 used `time_per_output_token`. Same shape as ttft_ms.
-        let tpot_ms = {
-            let sum = parsed
-                .counters
-                .get("vllm_request_time_per_output_token_seconds_sum")
-                .or_else(|| {
-                    parsed
-                        .counters
-                        .get("vllm_time_per_output_token_seconds_sum")
-                });
-            let count = parsed
-                .counters
-                .get("vllm_request_time_per_output_token_seconds_count")
-                .or_else(|| {
-                    parsed
-                        .counters
-                        .get("vllm_time_per_output_token_seconds_count")
-                });
-            match (sum, count) {
-                (Some(&s), Some(&c)) if c > 0.0 => Some((s / c) * 1000.0),
-                _ => None,
-            }
-        };
+        let tpot_ms = mean_ms(
+            counter("vllm_request_time_per_output_token_seconds_sum")
+                .or_else(|| counter("vllm_time_per_output_token_seconds_sum")),
+            counter("vllm_request_time_per_output_token_seconds_count")
+                .or_else(|| counter("vllm_time_per_output_token_seconds_count")),
+        );
 
-        // Tail latency percentiles. vLLM exposes `_bucket{le="..."}` lines for
-        // each request-level histogram. We linearly interpolate p50/p95/p99 in
-        // milliseconds (engine emits seconds). Returns `None` for the whole
-        // struct when no buckets exist or the engine has not observed any
-        // requests yet — the UI then renders dashes.
-        let percentiles_ms = |metric: &str| -> Option<LatencyPercentiles> {
-            let buckets = parsed.histograms.get(metric)?;
-            let to_ms = |q: f64| percentile(buckets, q).map(|s| s * 1000.0);
-            let p = LatencyPercentiles {
-                p50_ms: to_ms(0.50),
-                p95_ms: to_ms(0.95),
-                p99_ms: to_ms(0.99),
-            };
-            // If every quantile is None (e.g. only +Inf bucket present),
-            // collapse to None so the JSON payload stays compact.
-            if p.p50_ms.is_none() && p.p95_ms.is_none() && p.p99_ms.is_none() {
-                None
-            } else {
-                Some(p)
-            }
-        };
-        let ttft_percentiles = percentiles_ms("vllm_time_to_first_token_seconds");
-        let itl_percentiles = percentiles_ms("vllm_inter_token_latency_seconds");
-        let e2e_percentiles = percentiles_ms("vllm_e2e_request_latency_seconds");
-
-        // Goodput: % of histogram observations meeting the SLO. Thresholds
-        // come in milliseconds; the histograms are in seconds, so divide by
-        // 1000 before passing to fraction_le.
-        let goodput_pct = |metric: &str, slo_ms: f64| -> Option<f64> {
-            let buckets = parsed.histograms.get(metric)?;
-            fraction_le(buckets, slo_ms / 1000.0).map(|f| f * 100.0)
-        };
-        let ttft_goodput_pct = goodput_pct("vllm_time_to_first_token_seconds", TTFT_SLO_MS);
-        let itl_goodput_pct = goodput_pct("vllm_inter_token_latency_seconds", ITL_SLO_MS);
-        let e2e_goodput_pct = goodput_pct("vllm_e2e_request_latency_seconds", E2E_SLO_MS);
-
-        // Raw histogram buckets shipped to the frontend so it can recompute
-        // goodput at user-customized SLO thresholds without a roundtrip.
-        // `+Inf` is replaced with `f64::MAX` because serde_json cannot encode
-        // non-finite floats — the frontend port of `fraction_le` treats that
-        // sentinel as the overflow bucket.
-        let buckets_for = |metric: &str| -> Option<Vec<HistogramBucket>> {
-            let raw = parsed.histograms.get(metric)?;
-            if raw.is_empty() {
-                return None;
-            }
-            Some(
-                raw.iter()
-                    .map(|&(le, cum)| HistogramBucket {
-                        le_seconds: if le.is_finite() { le } else { f64::MAX },
-                        cumulative_count: cum,
-                    })
-                    .collect(),
-            )
-        };
-        let ttft_buckets = buckets_for("vllm_time_to_first_token_seconds");
-        let itl_buckets = buckets_for("vllm_inter_token_latency_seconds");
-        let e2e_buckets = buckets_for("vllm_e2e_request_latency_seconds");
+        // Tail latency percentiles, SLO goodput and the raw buckets, from the
+        // request-level histograms (`_bucket{le="..."}` lines, in seconds).
+        let ttft_percentiles = percentiles_ms(parsed, "vllm_time_to_first_token_seconds");
+        let itl_percentiles = percentiles_ms(parsed, "vllm_inter_token_latency_seconds");
+        let e2e_percentiles = percentiles_ms(parsed, "vllm_e2e_request_latency_seconds");
+        let ttft_goodput_pct = goodput_pct(parsed, "vllm_time_to_first_token_seconds", TTFT_SLO_MS);
+        let itl_goodput_pct = goodput_pct(parsed, "vllm_inter_token_latency_seconds", ITL_SLO_MS);
+        let e2e_goodput_pct = goodput_pct(parsed, "vllm_e2e_request_latency_seconds", E2E_SLO_MS);
+        let ttft_buckets = wire_buckets(parsed, "vllm_time_to_first_token_seconds");
+        let itl_buckets = wire_buckets(parsed, "vllm_inter_token_latency_seconds");
+        let e2e_buckets = wire_buckets(parsed, "vllm_e2e_request_latency_seconds");
 
         // TPOT has two possible histogram keys depending on vLLM version.
-        // Resolve whichever is present, then reuse the closures above.
+        // Resolve whichever is present, then read it like the others.
         let tpot_hist = if parsed
             .histograms
             .contains_key("vllm_request_time_per_output_token_seconds")
@@ -1029,9 +362,9 @@ impl EngineAdapter for VllmAdapter {
         } else {
             None
         };
-        let tpot_percentiles = tpot_hist.and_then(percentiles_ms);
-        let tpot_goodput_pct = tpot_hist.and_then(|m| goodput_pct(m, TPOT_SLO_MS));
-        let tpot_buckets = tpot_hist.and_then(buckets_for);
+        let tpot_percentiles = tpot_hist.and_then(|m| percentiles_ms(parsed, m));
+        let tpot_goodput_pct = tpot_hist.and_then(|m| goodput_pct(parsed, m, TPOT_SLO_MS));
+        let tpot_buckets = tpot_hist.and_then(|m| wire_buckets(parsed, m));
 
         // While warming, histogram-derived metrics still compute from raw
         // pass-through counters/buckets (the tracker doesn't yet have a
@@ -1125,6 +458,7 @@ fn spec_mean_acceptance_length(accepted: Option<f64>, drafts: Option<f64>) -> Op
 
 #[cfg(test)]
 mod tests {
+    use super::super::histogram::percentile;
     use super::*;
 
     /// vLLM fills every engine panel, so it declares every group — an operator
@@ -1138,183 +472,6 @@ mod tests {
             None,
         );
         assert_eq!(adapter.metric_groups(), MetricGroup::all());
-    }
-
-    /// HF enrichment misses for non-public model ids (401/403/404) are
-    /// expected and must stay quiet; other non-success statuses (e.g. 5xx,
-    /// 429) still surface as warnings.
-    #[test]
-    fn expected_hf_misses_are_quiet() {
-        for status in [401, 403, 404] {
-            assert!(is_expected_hf_miss(status), "{status} should be quiet");
-        }
-        for status in [200, 429, 500, 502, 503] {
-            assert!(!is_expected_hf_miss(status), "{status} should warn");
-        }
-    }
-
-    /// Offline launches (`HF_HUB_OFFLINE` + `--model <local dir>`) make vLLM
-    /// report a filesystem path as its model id. The hub-cache layout must be
-    /// de-mangled back to the repo id, and a bare snapshot dir must not leave
-    /// the commit hash as the display name; everything else passes through.
-    #[test]
-    fn normalize_model_id_recovers_repo_id_from_local_paths() {
-        // Hub-cache snapshot path → repo id (the reported bug).
-        assert_eq!(
-            normalize_model_id(
-                "/root/.cache/huggingface/hub/models--Qwen--Qwen3-32B\
-                 /snapshots/7b719225242aacd3dbd3f9407468c2ee9a9d2594"
-            ),
-            "Qwen/Qwen3-32B"
-        );
-        // Single dashes inside org/name survive; only the `--` separator splits.
-        assert_eq!(
-            normalize_model_id("/data/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/abc"),
-            "meta-llama/Llama-3.1-8B-Instruct"
-        );
-        // A snapshot dir outside the hub-cache layout: drop `snapshots/<hash>`
-        // so the containing directory names the model, not the hash.
-        assert_eq!(
-            normalize_model_id("/mnt/qwen3-32b/snapshots/7b719225242aacd3dbd3f9407468c2ee9a9d2594"),
-            "/mnt/qwen3-32b"
-        );
-        // HF ids, bare serve names, and plain paths pass through unchanged.
-        assert_eq!(normalize_model_id("Qwen/Qwen3-32B"), "Qwen/Qwen3-32B");
-        assert_eq!(normalize_model_id("my-alias"), "my-alias");
-        assert_eq!(
-            normalize_model_id("/models/custom-llm"),
-            "/models/custom-llm"
-        );
-        // A 40-char last segment that isn't hex is a name, not a commit hash.
-        assert_eq!(
-            normalize_model_id("/srv/snapshots/this-is-a-forty-char-model-name-not-hex"),
-            "/srv/snapshots/this-is-a-forty-char-model-name-not-hex"
-        );
-    }
-
-    /// `/v1/models` auth rejections (401/403) get their own reason — the one
-    /// failure the operator fixes on the dashboard's side. Everything else
-    /// (missing endpoint, throttling, server errors) is generic
-    /// unavailability.
-    #[test]
-    fn models_auth_statuses_classified_apart_from_other_failures() {
-        for status in [401, 403] {
-            assert_eq!(
-                classify_models_error_status(status),
-                ModelMetadataError::AuthRequired,
-                "{status} should read as an auth rejection"
-            );
-        }
-        for status in [404, 429, 500, 502, 503] {
-            assert_eq!(
-                classify_models_error_status(status),
-                ModelMetadataError::Unavailable,
-                "{status} should read as generic unavailability"
-            );
-        }
-    }
-
-    /// A rejected `/v1/models` falls back to the command-line hint, and the
-    /// auth reason travels with the fallback name — the warning accompanies
-    /// the name rather than replacing it. Without a hint, the reason stands
-    /// alone.
-    #[test]
-    fn auth_rejection_reports_reason_beside_fallback_name() {
-        let reply = ModelsEndpointReply::Failed(ModelMetadataError::AuthRequired);
-        assert_eq!(
-            resolve_model_name(&reply, Some("google/gemma-4-31B-it")),
-            (
-                Some("google/gemma-4-31B-it".into()),
-                Some(ModelMetadataError::AuthRequired)
-            )
-        );
-        assert_eq!(
-            resolve_model_name(&reply, None),
-            (None, Some(ModelMetadataError::AuthRequired))
-        );
-    }
-
-    /// A connection failure / non-auth error status resolves the same way but
-    /// with the non-auth reason, so the frontend never tells an operator to
-    /// configure a key that would not help.
-    #[test]
-    fn non_auth_failure_reports_unavailable() {
-        let reply = ModelsEndpointReply::Failed(ModelMetadataError::Unavailable);
-        assert_eq!(
-            resolve_model_name(&reply, Some("org/model")),
-            (
-                Some("org/model".into()),
-                Some(ModelMetadataError::Unavailable)
-            )
-        );
-        // A successful reply listing no models is not an auth problem either.
-        assert_eq!(
-            resolve_model_name(&ModelsEndpointReply::Empty, None),
-            (None, Some(ModelMetadataError::Unavailable))
-        );
-    }
-
-    /// A successful `/v1/models` reply carries no error and keeps the
-    /// long-standing precedence: a `Provider/`-prefixed API id wins, the hint
-    /// beats a bare slug, and a bare slug still resolves without a hint.
-    #[test]
-    fn successful_reply_keeps_precedence_and_reports_no_error() {
-        let prefixed = ModelsEndpointReply::Resolved("google/gemma-4-31B-it_FP16".into());
-        assert_eq!(
-            resolve_model_name(&prefixed, Some("hint/model")),
-            (Some("google/gemma-4-31B-it_FP16".into()), None)
-        );
-
-        let bare = ModelsEndpointReply::Resolved("gemma".into());
-        assert_eq!(
-            resolve_model_name(&bare, Some("google/gemma-4-31B-it")),
-            (Some("google/gemma-4-31B-it".into()), None)
-        );
-        assert_eq!(
-            resolve_model_name(&bare, None),
-            (Some("gemma".into()), None)
-        );
-    }
-
-    /// The HF enrichment cache is keyed by model id: it serves the same id
-    /// without a refetch, but must not hand a different id the stale entry —
-    /// the id legitimately changes once, when an auth-gated `/v1/models`
-    /// starts answering and replaces the command-line fallback the cache was
-    /// filled from. Both calls run inside the retry cooldown, so neither can
-    /// touch the network: whatever comes back is the cache's answer.
-    #[tokio::test]
-    async fn hf_cache_serves_only_the_id_it_was_filled_from() {
-        let adapter = VllmAdapter::new(
-            reqwest::Client::new(),
-            "http://localhost:8000".into(),
-            None,
-            None,
-        );
-        *adapter.hf_model_cache.lock().await = Some(ModelInfo {
-            name: "google/gemma-4-31B-it".into(),
-            parameter_size: Some("31.0B params".into()),
-            quantization: None,
-            precision: None,
-            tensor_type: None,
-            model_type: None,
-            pipeline_tag: None,
-        });
-        *adapter.last_hf_error.lock().await = Some(Instant::now());
-
-        let hit = adapter.fetch_hf_model_info("google/gemma-4-31B-it").await;
-        assert_eq!(
-            hit.map(|m| m.name),
-            Some("google/gemma-4-31B-it".to_string()),
-            "same id is served from the cache"
-        );
-
-        let miss = adapter
-            .fetch_hf_model_info("google/gemma-4-31B-it_FP16")
-            .await;
-        assert!(
-            miss.is_none(),
-            "a different id must not be renamed to the stale cache entry"
-        );
     }
 
     /// Sanity check: percentiles flow from the parser through the adapter.
@@ -1530,10 +687,11 @@ vllm:time_to_first_token_seconds_count 0.0
     }
 
     /// The frontend recomputes goodput from histogram buckets the backend
-    /// ships in `EngineMetrics`. This test mirrors the `buckets_for` closure
-    /// in `get_metrics()` against a representative `/metrics` body and
-    /// asserts the wire-shape contract: cumulative counts preserved, +Inf
-    /// replaced with `f64::MAX`, and the buckets serialize to plain JSON.
+    /// ships in `EngineMetrics`. This test runs `wire_buckets`, which
+    /// `get_metrics()` ships them through, against a representative
+    /// `/metrics` body and asserts the wire-shape contract: cumulative counts
+    /// preserved, +Inf replaced with `f64::MAX`, and the buckets serialize to
+    /// plain JSON.
     #[test]
     fn ttft_buckets_replace_infinity_with_f64_max() {
         let body = "\
@@ -1546,17 +704,7 @@ vllm:time_to_first_token_seconds_sum 12.0
 vllm:time_to_first_token_seconds_count 100.0
 ";
         let parsed = parse_prometheus_text(body).expect("parse");
-        let raw = parsed
-            .histograms
-            .get("vllm_time_to_first_token_seconds")
-            .expect("histogram");
-        let buckets: Vec<HistogramBucket> = raw
-            .iter()
-            .map(|&(le, cum)| HistogramBucket {
-                le_seconds: if le.is_finite() { le } else { f64::MAX },
-                cumulative_count: cum,
-            })
-            .collect();
+        let buckets = wire_buckets(&parsed, "vllm_time_to_first_token_seconds").expect("histogram");
         assert_eq!(buckets.len(), 3);
         assert!((buckets[0].le_seconds - 0.05).abs() < 1e-9);
         assert!((buckets[0].cumulative_count - 50.0).abs() < 1e-9);
@@ -1579,62 +727,7 @@ vllm:time_to_first_token_seconds_count 100.0
     fn ttft_buckets_none_when_metric_absent() {
         let body = "# Empty body, no histograms.\n";
         let parsed = parse_prometheus_text(body).expect("parse");
-        assert!(!parsed
-            .histograms
-            .contains_key("vllm_time_to_first_token_seconds"));
-    }
-
-    #[test]
-    fn format_param_size_formats_billions() {
-        assert_eq!(format_param_size(11_823_991_872), "11.8B params");
-        assert_eq!(format_param_size(7_000_000_000), "7.0B params");
-    }
-
-    #[test]
-    fn format_param_size_formats_millions() {
-        assert_eq!(format_param_size(500_000_000), "500.0M params");
-        assert_eq!(format_param_size(1_000_000), "1.0M params");
-    }
-
-    #[test]
-    fn format_quant_method_formats_known_methods() {
-        assert_eq!(format_quant_method("auto-round"), "AutoRound");
-        assert_eq!(format_quant_method("gptq"), "GPTQ");
-        assert_eq!(format_quant_method("awq"), "AWQ");
-        assert_eq!(format_quant_method("bitsandbytes"), "BitsAndBytes");
-        assert_eq!(format_quant_method("fp8"), "FP8");
-    }
-
-    #[test]
-    fn format_quant_method_passes_through_unknown() {
-        assert_eq!(format_quant_method("some-new-method"), "some-new-method");
-    }
-
-    #[test]
-    fn format_precision_produces_label() {
-        assert_eq!(format_precision(4), "4-bit precision");
-        assert_eq!(format_precision(8), "8-bit precision");
-    }
-
-    #[test]
-    fn format_tensor_type_prefers_float_dtypes() {
-        let mut params = std::collections::HashMap::new();
-        params.insert("BF16".into(), 1000);
-        params.insert("I32".into(), 5000);
-        assert_eq!(format_tensor_type(&params), Some("BF16".into()));
-    }
-
-    #[test]
-    fn format_tensor_type_falls_back_to_first_key() {
-        let mut params = std::collections::HashMap::new();
-        params.insert("I32".into(), 5000);
-        assert_eq!(format_tensor_type(&params), Some("I32".into()));
-    }
-
-    #[test]
-    fn format_tensor_type_returns_none_for_empty() {
-        let params = std::collections::HashMap::new();
-        assert_eq!(format_tensor_type(&params), None);
+        assert!(wire_buckets(&parsed, "vllm_time_to_first_token_seconds").is_none());
     }
 
     /// Cumulative token counters flow from the parser to the new

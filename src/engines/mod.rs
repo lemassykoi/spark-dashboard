@@ -1,5 +1,7 @@
+mod common;
 pub mod detector;
 pub mod histogram;
+mod model_info;
 pub mod prometheus;
 pub mod sglang;
 #[cfg(test)]
