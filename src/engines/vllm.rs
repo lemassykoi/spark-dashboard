@@ -17,6 +17,10 @@ use tokio::sync::Mutex;
 /// allocation; excluding one request consistently removes the outlier.
 const DEFAULT_WARMUP_SKIP_REQUESTS: u64 = 1;
 
+/// The request counter warmup progress is measured on: every vLLM request
+/// adds one observation to the time-to-first-token histogram.
+const WARMUP_TRIGGER_KEY: &str = "vllm_time_to_first_token_seconds_count";
+
 /// Read the warmup-skip threshold from the environment. Falls back silently
 /// to the default on parse failure or when the variable is unset.
 fn warmup_skip_from_env() -> u64 {
@@ -124,7 +128,10 @@ impl VllmAdapter {
             prev_spec_decode: Mutex::new(None),
             avg_accum: Mutex::new((0.0, 0)),
             avg_prompt_accum: Mutex::new((0.0, 0)),
-            warmup: Mutex::new(WarmupTracker::new(warmup_skip_from_env())),
+            warmup: Mutex::new(WarmupTracker::new(
+                warmup_skip_from_env(),
+                WARMUP_TRIGGER_KEY,
+            )),
             hf_model_cache: Mutex::new(None),
             last_hf_error: Mutex::new(None),
         }
@@ -1473,7 +1480,7 @@ vllm:time_to_first_token_seconds_sum 0.0
 vllm:time_to_first_token_seconds_count 0.0
 ";
 
-        let mut tracker = WarmupTracker::new(1);
+        let mut tracker = WarmupTracker::new(1, WARMUP_TRIGGER_KEY);
 
         let parsed_idle = parse_prometheus_text(body_idle).expect("parse idle");
         let out_idle = tracker.observe(&parsed_idle);

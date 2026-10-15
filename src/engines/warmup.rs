@@ -14,12 +14,6 @@
 use super::prometheus::ParsedMetrics;
 use std::collections::HashMap;
 
-/// Counter name used to gauge "how many requests has this engine handled" —
-/// shared with `VllmAdapter::get_metrics`. Every vLLM request emits exactly one
-/// observation into this histogram, so its `_count` doubles as a request
-/// counter without needing a separate gauge.
-const TRIGGER_COUNT_KEY: &str = "vllm_time_to_first_token_seconds_count";
-
 /// Cumulative-metric snapshot taken at the moment warmup completes. All
 /// subsequent polls compute `current - baseline` for every counter and
 /// histogram bucket so the warmup observations stop polluting averages and
@@ -42,12 +36,15 @@ enum WarmupState {
 /// Per-engine warmup tracker. One instance lives inside each engine adapter,
 /// guarded by a `Mutex` for the async polling loop.
 ///
-/// The tracker is engine-agnostic — it only depends on `ParsedMetrics` and a
-/// well-known counter key (`vllm_time_to_first_token_seconds_count`). Future
-/// adapters that emit a different trigger key can be supported by parameterizing
-/// the constructor.
+/// The tracker is engine-agnostic — it only depends on `ParsedMetrics` and the
+/// trigger key its adapter hands it: the counter that says how many requests
+/// the engine has handled, under that engine's own metric name.
 pub struct WarmupTracker {
     skip_requests: u64,
+    /// The request counter warmup progress is measured on — e.g. vLLM's
+    /// `vllm_time_to_first_token_seconds_count`. A key the scrape never
+    /// carries reads as zero requests forever, and warmup never ends.
+    trigger_key: &'static str,
     state: WarmupState,
 }
 
@@ -67,7 +64,10 @@ pub struct WarmupOutput {
 
 impl WarmupTracker {
     /// Construct a tracker that excludes the first `skip_requests` requests
-    /// the engine handles after we start watching it.
+    /// the engine handles after we start watching it, counted on
+    /// `trigger_key`. Every request an engine serves adds exactly one
+    /// observation to its time-to-first-token histogram, so that histogram's
+    /// `_count` is the natural key.
     ///
     /// **Already-running engines:** if the dashboard attaches to a vLLM that
     /// has already served thousands of requests, we cannot tell which of those
@@ -79,9 +79,10 @@ impl WarmupTracker {
     /// **`skip_requests = 0`:** baselines on the first poll. Useful as an
     /// override but does not skip any warmup observations — only filters out
     /// pre-attach cumulative pollution for already-running engines.
-    pub fn new(skip_requests: u64) -> Self {
+    pub fn new(skip_requests: u64, trigger_key: &'static str) -> Self {
         Self {
             skip_requests,
+            trigger_key,
             state: WarmupState::Warming {
                 initial_total: None,
             },
@@ -94,7 +95,7 @@ impl WarmupTracker {
     pub fn observe(&mut self, parsed: &ParsedMetrics) -> WarmupOutput {
         let current_total = parsed
             .counters
-            .get(TRIGGER_COUNT_KEY)
+            .get(self.trigger_key)
             .map(|v| *v as u64)
             .unwrap_or(0);
 
@@ -263,6 +264,9 @@ mod tests {
     use super::super::prometheus::GaugeSeries;
     use super::*;
 
+    /// The vLLM trigger key, which most tests below are written against.
+    const TRIGGER_COUNT_KEY: &str = "vllm_time_to_first_token_seconds_count";
+
     fn metrics(
         counters: &[(&str, f64)],
         histograms: &[(&str, &[(f64, f64)])],
@@ -292,7 +296,7 @@ mod tests {
 
     #[test]
     fn first_poll_captures_initial_total_and_warms_up() {
-        let mut t = WarmupTracker::new(1);
+        let mut t = WarmupTracker::new(1, TRIGGER_COUNT_KEY);
         let m = metrics(&[(TRIGGER_COUNT_KEY, 0.0)], &[], &[]);
         let out = t.observe(&m);
         assert!(out.warming_up);
@@ -307,7 +311,7 @@ mod tests {
 
     #[test]
     fn transitions_to_active_when_skip_threshold_reached() {
-        let mut t = WarmupTracker::new(1);
+        let mut t = WarmupTracker::new(1, TRIGGER_COUNT_KEY);
         // First poll: cursor at 0, still warming.
         let _ = t.observe(&metrics(&[(TRIGGER_COUNT_KEY, 0.0)], &[], &[]));
         // Second poll: 1 request arrived → transition.
@@ -345,7 +349,7 @@ mod tests {
 
     #[test]
     fn post_baseline_yields_correct_deltas() {
-        let mut t = WarmupTracker::new(1);
+        let mut t = WarmupTracker::new(1, TRIGGER_COUNT_KEY);
         // Warmup
         let _ = t.observe(&metrics(&[(TRIGGER_COUNT_KEY, 0.0)], &[], &[]));
         // Baseline at count=1, slow observation in tail
@@ -416,7 +420,7 @@ mod tests {
 
     #[test]
     fn warming_regression_resets_initial_cursor() {
-        let mut t = WarmupTracker::new(3);
+        let mut t = WarmupTracker::new(3, TRIGGER_COUNT_KEY);
         let _ = t.observe(&metrics(&[(TRIGGER_COUNT_KEY, 10.0)], &[], &[]));
         // Restart while still warming: count drops below initial.
         let _ = t.observe(&metrics(&[(TRIGGER_COUNT_KEY, 0.0)], &[], &[]));
@@ -428,7 +432,7 @@ mod tests {
 
     #[test]
     fn active_regression_resets_to_warming() {
-        let mut t = WarmupTracker::new(0);
+        let mut t = WarmupTracker::new(0, TRIGGER_COUNT_KEY);
         // Skip=0 → first poll baselines immediately.
         let _ = t.observe(&metrics(
             &[
@@ -457,7 +461,7 @@ mod tests {
 
     #[test]
     fn schema_drift_drops_only_affected_histogram() {
-        let mut t = WarmupTracker::new(1);
+        let mut t = WarmupTracker::new(1, TRIGGER_COUNT_KEY);
         let _ = t.observe(&metrics(&[(TRIGGER_COUNT_KEY, 0.0)], &[], &[]));
         let _ = t.observe(&metrics(
             &[(TRIGGER_COUNT_KEY, 1.0)],
@@ -486,7 +490,7 @@ mod tests {
 
     #[test]
     fn skip_zero_baselines_on_first_poll() {
-        let mut t = WarmupTracker::new(0);
+        let mut t = WarmupTracker::new(0, TRIGGER_COUNT_KEY);
         let m = metrics(
             &[
                 (TRIGGER_COUNT_KEY, 5.0),
@@ -499,5 +503,32 @@ mod tests {
         assert!(!out.warming_up);
         assert!(out.just_transitioned);
         assert!(matches!(t.state, WarmupState::Active { .. }));
+    }
+
+    /// Each engine names its request counter differently. A tracker counts on
+    /// the key its adapter hands it, so an engine whose scrape never carries
+    /// vLLM's key still leaves warmup once it serves a request.
+    #[test]
+    fn warmup_ends_on_the_trigger_key_the_adapter_names() {
+        const SGLANG_KEY: &str = "sglang_time_to_first_token_seconds_count";
+        let mut t = WarmupTracker::new(1, SGLANG_KEY);
+        assert!(
+            t.observe(&metrics(&[(SGLANG_KEY, 3.0)], &[], &[]))
+                .warming_up
+        );
+        let out = t.observe(&metrics(&[(SGLANG_KEY, 4.0)], &[], &[]));
+        assert!(!out.warming_up);
+        assert!(out.just_transitioned);
+
+        // The same scrapes against a tracker watching vLLM's key read as no
+        // requests at all, and never leave warmup — the bug this guards.
+        let mut wrong = WarmupTracker::new(1, TRIGGER_COUNT_KEY);
+        for count in [3.0, 4.0, 50.0] {
+            assert!(
+                wrong
+                    .observe(&metrics(&[(SGLANG_KEY, count)], &[], &[]))
+                    .warming_up
+            );
+        }
     }
 }

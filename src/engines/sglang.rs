@@ -22,6 +22,10 @@ use tokio::sync::Mutex;
 /// group as "not reported", which would describe the wrong fact.
 pub const METRICS_LAUNCH_FLAG: &str = "--enable-metrics";
 
+/// The request counter warmup progress is measured on: every SGLang request
+/// adds one observation to the time-to-first-token histogram, as on vLLM.
+const WARMUP_TRIGGER_KEY: &str = "sglang_time_to_first_token_seconds_count";
+
 /// Read the warmup-skip threshold from the environment, shared convention
 /// with the vLLM adapter (`SPARK_WARMUP_SKIP_REQUESTS`).
 fn warmup_skip_from_env() -> u64 {
@@ -73,7 +77,10 @@ impl SglangAdapter {
             prev_prompt_tokens: Mutex::new(None),
             avg_accum: Mutex::new((0.0, 0)),
             avg_prompt_accum: Mutex::new((0.0, 0)),
-            warmup: Mutex::new(WarmupTracker::new(warmup_skip_from_env())),
+            warmup: Mutex::new(WarmupTracker::new(
+                warmup_skip_from_env(),
+                WARMUP_TRIGGER_KEY,
+            )),
             hf_model_cache: Mutex::new(None),
             last_hf_error: Mutex::new(None),
             metrics_off: AtomicBool::new(false),
@@ -372,6 +379,7 @@ impl EngineAdapter for SglangAdapter {
 
         Some(engine_metrics(
             parsed,
+            &raw,
             RateInputs {
                 tokens_per_sec,
                 prompt_tokens_per_sec,
@@ -414,9 +422,16 @@ fn metrics_off_signal(success: bool, code: u16, has_series: bool) -> Option<bool
 /// Map one parsed SGLang scrape onto the engine snapshot.
 /// Pure: the fetch, the metrics-off latch, the warmup tracker and the rate
 /// state stay in `get_metrics`; everything here reads the scrape and nothing
-/// else. `warming_up` blanks the delta-derived fields exactly as the vLLM
-/// adapter blanks them.
-fn engine_metrics(parsed: &ParsedMetrics, rates: RateInputs, warming_up: bool) -> EngineMetrics {
+/// else. `parsed` is the scrape after the warmup baseline is subtracted,
+/// `raw` the same scrape as read, for the lifetime figures that must not
+/// restart at the baseline. `warming_up` blanks the delta-derived fields
+/// exactly as the vLLM adapter blanks them.
+fn engine_metrics(
+    parsed: &ParsedMetrics,
+    raw: &ParsedMetrics,
+    rates: RateInputs,
+    warming_up: bool,
+) -> EngineMetrics {
     let counter = |name: &str| parsed.counters.get(name).copied();
 
     // Each data-parallel rank logs its own series of the scheduler gauges
@@ -461,9 +476,12 @@ fn engine_metrics(parsed: &ParsedMetrics, rates: RateInputs, warming_up: bool) -
 
     // Request count: TTFT observations == requests that reached first
     // token. The same pass-through lifetime display the vLLM adapter
-    // derives from the same quantity; read absolute so it does not dip
-    // across the warmup baseline.
-    let total_requests = counter("sglang_time_to_first_token_seconds_count").map(|v| v as u64);
+    // derives from the same quantity; read from `raw` so it does not drop
+    // to zero at the warmup baseline.
+    let total_requests = raw
+        .counters
+        .get("sglang_time_to_first_token_seconds_count")
+        .map(|&v| v as u64);
 
     // Per-request prefill throughput: prompt tokens per second of TTFT.
     // Same shape as the vLLM adapter's approximation.
@@ -629,6 +647,12 @@ mod tests {
         parse_sglang(REAL).expect("fixture parses")
     }
 
+    /// `engine_metrics` for a scrape no baseline has been subtracted from —
+    /// one that is its own raw reading.
+    fn map_unbaselined(parsed: &ParsedMetrics, rates: RateInputs, warming: bool) -> EngineMetrics {
+        engine_metrics(parsed, parsed, rates, warming)
+    }
+
     #[test]
     fn real_scrape_series_arrive_under_underscored_names() {
         let p = parsed_real();
@@ -701,7 +725,7 @@ mod tests {
             avg_tokens_per_sec: Some(25.0),
             avg_prompt_tokens_per_sec: Some(90.0),
         };
-        let blank = engine_metrics(&parsed_real(), rates, true);
+        let blank = map_unbaselined(&parsed_real(), rates, true);
         assert_eq!(blank.tokens_per_sec, None);
         assert_eq!(blank.avg_tokens_per_sec, None);
         assert_eq!(blank.prompt_tokens_per_sec, None);
@@ -716,7 +740,7 @@ mod tests {
         assert!(blank.ttft_buckets.is_none());
         assert!(blank.warming_up);
 
-        let live = engine_metrics(&parsed_real(), rates, false);
+        let live = map_unbaselined(&parsed_real(), rates, false);
         assert_eq!(live.tokens_per_sec, Some(30.0));
         assert_eq!(live.avg_prompt_tokens_per_sec, Some(90.0));
         assert!(live.ttft_ms.unwrap() > 0.0);
@@ -733,7 +757,7 @@ mod tests {
         // The whole ADR-0004 contract in one test: every field SGLang has a
         // series for carries the captured value, every field it has none for
         // stays None — no zero, no estimate, no stand-in.
-        let m = engine_metrics(&parsed_real(), RateInputs::default(), false);
+        let m = map_unbaselined(&parsed_real(), RateInputs::default(), false);
         assert_eq!(m.active_requests, Some(1));
         assert_eq!(m.queued_requests, Some(0));
         assert!((m.kv_cache_percent.unwrap() - 38.13953488372093).abs() < 1e-9);
@@ -789,7 +813,7 @@ mod tests {
                     # TYPE sglang:spec_accept_length gauge\n\
                     sglang:spec_accept_length{engine_type=\"unified\"} 0.0\n";
         let parsed = parse_sglang(body).expect("parses");
-        let m = engine_metrics(&parsed, RateInputs::default(), false);
+        let m = map_unbaselined(&parsed, RateInputs::default(), false);
         assert_eq!(m.active_requests, Some(4));
         assert_eq!(m.spec_decode_acceptance_rate, None);
         assert_eq!(m.spec_decode_mean_acceptance_length, None);
@@ -840,7 +864,7 @@ sglang:spec_accept_rate{dp_rank=\"1\",model_name=\"m\",tp_rank=\"1\"} 0.4
 sglang:spec_accept_rate{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 0.8
 ";
         let parsed = parse_sglang(body).expect("parses");
-        let m = engine_metrics(&parsed, RateInputs::default(), false);
+        let m = map_unbaselined(&parsed, RateInputs::default(), false);
         assert_eq!(m.active_requests, Some(15));
         assert_eq!(m.queued_requests, Some(3));
         let kv = m.kv_cache_percent.expect("kv");
@@ -865,7 +889,7 @@ sglang:spec_accept_length{dp_rank=\"1\"} 0.0
 sglang:spec_accept_rate{dp_rank=\"0\"} 0.8
 sglang:spec_accept_rate{dp_rank=\"1\"} 0.0
 ";
-        let m = engine_metrics(
+        let m = map_unbaselined(
             &parse_sglang(body).expect("parses"),
             RateInputs::default(),
             false,
@@ -885,7 +909,7 @@ sglang:num_running_reqs{model_name=\"m\",priority=\"\"} 5.0
 sglang:num_running_reqs{model_name=\"m\",priority=\"0\"} 3.0
 sglang:num_running_reqs{model_name=\"m\",priority=\"1\"} 2.0
 ";
-        let m = engine_metrics(
+        let m = map_unbaselined(
             &parse_sglang(body).expect("parses"),
             RateInputs::default(),
             false,
@@ -901,7 +925,7 @@ sglang:num_running_reqs{model_name=\"m\",priority=\"1\"} 2.0
 # TYPE sglang:token_usage gauge
 sglang:token_usage{model_name=\"m\"} 0.25
 ";
-        let m = engine_metrics(
+        let m = map_unbaselined(
             &parse_sglang(body).expect("parses"),
             RateInputs::default(),
             false,
@@ -943,5 +967,63 @@ sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",role=\"decode\"} 4
         assert_eq!(adapter.metric_groups(), MetricGroup::all());
         assert!(!adapter.metrics_off());
         assert_eq!(adapter.metrics_launch_flag(), Some("--enable-metrics"));
+    }
+
+    /// A body whose request and token counters stand at `requests` and
+    /// `tokens` — the shape a live engine's scrape grows through.
+    fn growing_scrape(requests: u64, tokens: u64) -> String {
+        format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.5\",is_streaming=\"true\"}} {requests}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"+Inf\",is_streaming=\"true\"}} {requests}\n\
+             sglang:time_to_first_token_seconds_sum{{is_streaming=\"true\"}} {sum}\n\
+             sglang:time_to_first_token_seconds_count{{is_streaming=\"true\"}} {requests}\n\
+             # TYPE sglang:generation_tokens_total counter\n\
+             sglang:generation_tokens_total{{is_streaming=\"true\"}} {tokens}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs{{tp_rank=\"0\"}} 1.0\n",
+            sum = requests as f64 * 0.1,
+        )
+    }
+
+    /// Warmup ends on SGLang's own request counter. It was measured on
+    /// vLLM's, which an SGLang scrape never carries, so at the default
+    /// `SPARK_WARMUP_SKIP_REQUESTS=1` the engine stayed warming forever and
+    /// every rate, mean, percentile and goodput figure stayed blank. And the
+    /// lifetime request count stays absolute across the baseline.
+    #[tokio::test]
+    async fn warmup_completes_as_sglang_serves_requests() {
+        use super::super::test_server::TestServer;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let polls = Arc::new(AtomicU64::new(0));
+        let served = polls.clone();
+        let server = TestServer::start(move |_| {
+            let n = served.fetch_add(1, Ordering::SeqCst);
+            (200, growing_scrape(5 + n, 1000 + 100 * n))
+        })
+        .await;
+        let adapter = SglangAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+
+        // First scrape: 5 requests already served — the attach cursor.
+        let first = adapter.get_metrics().await.expect("metrics");
+        assert!(first.warming_up);
+        assert_eq!(first.total_requests, Some(5));
+        assert_eq!(first.tokens_per_sec, None);
+
+        // One more request: warmup is over, and the lifetime count does not
+        // restart at the baseline.
+        let second = adapter.get_metrics().await.expect("metrics");
+        assert!(!second.warming_up, "warmup ends after one request");
+        assert_eq!(second.total_requests, Some(6));
+
+        // Steady state: the delta-derived figures fill in.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let third = adapter.get_metrics().await.expect("metrics");
+        assert!(!third.warming_up);
+        assert_eq!(third.total_requests, Some(7));
+        assert!(third.tokens_per_sec.is_some_and(|tps| tps > 0.0));
+        assert!(third.ttft_ms.is_some_and(|ms| ms > 0.0));
     }
 }
