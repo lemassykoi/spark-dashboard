@@ -460,7 +460,7 @@ fn metrics_off_signal(success: bool, code: u16, has_series: bool) -> Option<bool
 /// else. `warming_up` blanks the delta-derived fields exactly as the vLLM
 /// adapter blanks them.
 fn engine_metrics(parsed: &ParsedMetrics, rates: RateInputs, warming_up: bool) -> EngineMetrics {
-    let gauge = |name: &str| parsed.gauges.get(name).copied();
+    let gauge = |name: &str| parsed.gauge_sum(name);
     let counter = |name: &str| parsed.counters.get(name).copied();
 
     let active_requests = gauge("sglang_num_running_reqs").map(|v| v as u64);
@@ -675,12 +675,12 @@ mod tests {
     #[test]
     fn real_scrape_series_arrive_under_underscored_names() {
         let p = parsed_real();
-        assert_eq!(p.gauges.get("sglang_num_running_reqs"), Some(&1.0));
+        assert_eq!(p.gauge_sum("sglang_num_running_reqs"), Some(1.0));
         assert_eq!(
-            p.gauges.get("sglang_full_token_usage"),
-            Some(&0.3813953488372093)
+            p.gauge_sum("sglang_full_token_usage"),
+            Some(0.3813953488372093)
         );
-        assert_eq!(p.gauges.get("sglang_spec_accept_length"), Some(&2.8));
+        assert_eq!(p.gauge_sum("sglang_spec_accept_length"), Some(2.8));
     }
 
     /// The whole point of aggregating: a counter split across streaming and
@@ -868,7 +868,7 @@ mod tests {
         let body = "sglang:num_running_reqs 2.0\nsglang:num_running_reqs 5.0\n";
         let aggregated = aggregate_sglang_body(body).expect("aggregates");
         let parsed = parse_prometheus_text(&aggregated).expect("parses");
-        assert_eq!(parsed.gauges.get("sglang_num_running_reqs"), Some(&2.0));
+        assert_eq!(parsed.gauge_sum("sglang_num_running_reqs"), Some(2.0));
     }
 
     /// SGLang says "metrics off" with a flag name, not with an empty group

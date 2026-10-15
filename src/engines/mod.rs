@@ -2,6 +2,8 @@ pub mod detector;
 pub mod histogram;
 pub mod prometheus;
 pub mod sglang;
+#[cfg(test)]
+pub(crate) mod test_server;
 pub mod vllm;
 pub mod warmup;
 

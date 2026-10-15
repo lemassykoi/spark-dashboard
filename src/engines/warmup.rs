@@ -178,11 +178,7 @@ impl WarmupTracker {
 /// over the gauges and counters so pass-through fields (active/queued/kv_cache)
 /// remain populated.
 fn clone_passthrough(parsed: &ParsedMetrics) -> ParsedMetrics {
-    ParsedMetrics {
-        gauges: parsed.gauges.clone(),
-        counters: parsed.counters.clone(),
-        histograms: parsed.histograms.clone(),
-    }
+    parsed.clone()
 }
 
 /// Returns true if any baselined counter has dropped below its baseline value
@@ -264,6 +260,7 @@ fn same_schema(a: &[(f64, f64)], b: &[(f64, f64)]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::prometheus::GaugeSeries;
     use super::*;
 
     fn metrics(
@@ -280,7 +277,16 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), v.to_vec()))
                 .collect(),
-            gauges: gauges.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            gauges: gauges
+                .iter()
+                .map(|(k, v)| {
+                    let series = GaugeSeries {
+                        labels: HashMap::new(),
+                        value: *v,
+                    };
+                    ((*k).to_string(), vec![series])
+                })
+                .collect(),
         }
     }
 
@@ -403,8 +409,8 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-9, "sum delta {sum}");
         // Gauges pass through untouched.
         assert_eq!(
-            out.adjusted.gauges.get("vllm_num_requests_running"),
-            Some(&2.0)
+            out.adjusted.gauge_sum("vllm_num_requests_running"),
+            Some(2.0)
         );
     }
 

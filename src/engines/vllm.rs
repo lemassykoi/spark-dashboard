@@ -636,19 +636,20 @@ impl EngineAdapter for VllmAdapter {
         let parsed = &warmup_out.adjusted;
         let warming_up = warmup_out.warming_up;
 
+        // Under data parallelism each engine core reports its own series
+        // (`engine="0"`, `engine="1"`): the request counts partition the
+        // engine's work and sum, while each core's KV usage is a ratio of its
+        // own pool, so the engine-wide figure is their mean.
         let active_requests = parsed
-            .gauges
-            .get("vllm_num_requests_running")
-            .map(|v| *v as u64);
+            .gauge_sum("vllm_num_requests_running")
+            .map(|v| v as u64);
         let queued_requests = parsed
-            .gauges
-            .get("vllm_num_requests_waiting")
-            .map(|v| *v as u64);
+            .gauge_sum("vllm_num_requests_waiting")
+            .map(|v| v as u64);
         // v1 uses vllm_kv_cache_usage_perc, v0.6 uses vllm_gpu_cache_usage_perc
         let kv_cache_percent = parsed
-            .gauges
-            .get("vllm_kv_cache_usage_perc")
-            .or_else(|| parsed.gauges.get("vllm_gpu_cache_usage_perc"))
+            .gauge_mean("vllm_kv_cache_usage_perc")
+            .or_else(|| parsed.gauge_mean("vllm_gpu_cache_usage_perc"))
             .map(|v| v * 100.0);
 
         // TTFT from histogram sum/count (average)
@@ -801,9 +802,8 @@ impl EngineAdapter for VllmAdapter {
 
         // Swapped requests (memory pressure indicator)
         let swapped_requests = parsed
-            .gauges
-            .get("vllm_num_requests_swapped")
-            .map(|v| *v as u64);
+            .gauge_sum("vllm_num_requests_swapped")
+            .map(|v| v as u64);
 
         // Prefix cache hit rate as percentage, computed from the two counters
         // vLLM exposes (vllm:prefix_cache_hits / vllm:prefix_cache_queries).
@@ -1757,5 +1757,53 @@ vllm:generation_tokens_total 42.0
         assert!(!parsed
             .counters
             .contains_key("vllm_spec_decode_num_draft_tokens"));
+    }
+
+    /// Under data parallelism vLLM labels each engine core's series
+    /// (`engine="0"`, `engine="1"`). The snapshot is the whole engine: request
+    /// counts and token counters sum across the cores, and KV usage — each
+    /// core's ratio of its own pool — is their mean. Before the parser
+    /// combined label series, whichever core's line came last stood in for
+    /// all of them.
+    #[tokio::test]
+    async fn data_parallel_engine_cores_combine_into_one_engine() {
+        use super::super::test_server::TestServer;
+        let body = "\
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine=\"0\",model_name=\"m\"} 8.0
+vllm:num_requests_running{engine=\"1\",model_name=\"m\"} 7.0
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine=\"0\",model_name=\"m\"} 2.0
+vllm:num_requests_waiting{engine=\"1\",model_name=\"m\"} 1.0
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"m\"} 0.5
+vllm:kv_cache_usage_perc{engine=\"1\",model_name=\"m\"} 0.3
+# TYPE vllm:prompt_tokens counter
+vllm:prompt_tokens_total{engine=\"0\",model_name=\"m\"} 100.0
+vllm:prompt_tokens_total{engine=\"1\",model_name=\"m\"} 50.0
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"m\"} 4
+vllm:time_to_first_token_seconds_bucket{engine=\"1\",le=\"+Inf\",model_name=\"m\"} 6
+vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"m\"} 1.0
+vllm:time_to_first_token_seconds_sum{engine=\"1\",model_name=\"m\"} 2.0
+vllm:time_to_first_token_seconds_count{engine=\"0\",model_name=\"m\"} 4
+vllm:time_to_first_token_seconds_count{engine=\"1\",model_name=\"m\"} 6
+";
+        let server = TestServer::start(move |_| (200, body.to_string())).await;
+        let adapter = VllmAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+
+        let m = adapter.get_metrics().await.expect("metrics");
+        assert_eq!(m.active_requests, Some(15));
+        assert_eq!(m.queued_requests, Some(3));
+        let kv = m.kv_cache_percent.expect("kv");
+        assert!((kv - 40.0).abs() < 1e-9, "mean of 50% and 30%, got {kv}");
+        assert_eq!(m.total_prompt_tokens, Some(150));
+        assert_eq!(m.total_requests, Some(10));
+
+        // One scrape, unauthenticated: no key was configured.
+        let asked = server.requests();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].path, "/metrics");
+        assert_eq!(asked[0].authorization, None);
     }
 }
