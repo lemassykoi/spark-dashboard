@@ -1,6 +1,6 @@
 use super::{DeploymentMode, EngineType};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::time::Duration;
 
 /// A candidate engine discovered by the detection layers.
@@ -26,18 +26,20 @@ pub struct DetectedEngine {
     pub container_id: Option<String>,
 }
 
-/// Known engine binaries and their default ports.
-const ENGINE_BINARIES: &[(&str, EngineType, &str)] = &[
-    ("vllm", EngineType::Vllm, "http://localhost:8000"),
-    ("sglang", EngineType::Sglang, "http://localhost:30000"),
-];
-
 /// The port vLLM serves on when it is not told otherwise. Used wherever a
 /// candidate is found but its port cannot be read off the command line.
 const VLLM_DEFAULT_PORT: u16 = 8000;
 
 /// SGLang's default HTTP port (`--port` unset), same role as above.
 const SGLANG_DEFAULT_PORT: u16 = 30000;
+
+/// The port an engine type serves on when it is not told otherwise.
+fn default_port(engine_type: &EngineType) -> u16 {
+    match engine_type {
+        EngineType::Vllm => VLLM_DEFAULT_PORT,
+        EngineType::Sglang => SGLANG_DEFAULT_PORT,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public detection entry point
@@ -117,113 +119,138 @@ fn merge_docker_candidates(
     }
 }
 
-/// Whether a process command line is a vLLM server rather than something that
-/// merely mentions it.
+/// Which engine's server an argument names, if any. The launch forms:
+///   * vLLM: the `vllm` CLI (`vllm serve ...`, also by path), and
+///     `python -m vllm.entrypoints.openai.api_server ...`;
+///   * SGLang: the `sglang` CLI (`sglang serve ...`, also by path), and
+///     `python -m sglang.launch_server ...` (the documented one) or a
+///     `sglang.srt` module.
 ///
-/// Matches the entrypoint forms the process scanner already recognizes, so a
-/// container is judged by the same evidence a host process is: the binary being
-/// run, not a name somebody chose.
+/// Deliberately token-precise: a proxy named "sglang-sidecar" runs nothing
+/// until a command line proves otherwise, and an argument that merely
+/// contains an engine's name (a log file, a config file) is not the server
+/// itself.
+fn server_named_by(arg: &str) -> Option<EngineType> {
+    if arg == "vllm" || arg.ends_with("/vllm") || arg.contains("vllm.entrypoints") {
+        Some(EngineType::Vllm)
+    } else if arg == "sglang"
+        || arg.ends_with("/sglang")
+        || arg.contains("sglang.launch_server")
+        || arg.contains("sglang.srt")
+    {
+        Some(EngineType::Sglang)
+    } else {
+        None
+    }
+}
+
+/// Which engine a command line runs, if any: the first argument that names
+/// an engine's server decides. The program comes before its arguments, so a
+/// path or flag value that happens to name the other engine —
+/// `python3 -m sglang.launch_server --download-dir /data/vllm` — cannot turn
+/// the process into that engine too. A process is at most one engine.
+fn engine_of_command<'a>(args: impl IntoIterator<Item = &'a str>) -> Option<EngineType> {
+    args.into_iter().find_map(server_named_by)
+}
+
+/// The argv form of [`engine_of_command`], for the host process scan: each
+/// argument is intact, so a model path with spaces cannot split into a false
+/// match.
+fn engine_of_process(cmd: &[OsString]) -> Option<EngineType> {
+    engine_of_command(cmd.iter().filter_map(|arg| arg.to_str()))
+}
+
+/// Whether a whole command line (a `docker top` row) runs the given engine's
+/// server rather than something that merely mentions it — the same evidence
+/// a host process is judged by: the binary being run, not a name somebody
+/// chose.
 ///
 /// Like everything the container classification uses, only reachable from the
 /// Linux Docker path in normal builds, but the unit tests exercise it on every
 /// platform — hence the `test` cfg.
 #[cfg(any(target_os = "linux", test))]
-fn is_vllm_process(command: &str) -> bool {
-    command.split_whitespace().any(vllm_arg_is_server)
+fn runs_engine(command: &str, engine_type: &EngineType) -> bool {
+    engine_of_command(command.split_whitespace()).as_ref() == Some(engine_type)
 }
 
-/// The single-argument form of the matcher, so a scanner holding an argv
-/// slice (where each argument is intact — a model path with spaces must not
-/// split into a false match) can use the same precision as the whole-line
-/// form used for `docker top` output.
-fn vllm_arg_is_server(arg: &str) -> bool {
-    arg == "vllm" || arg.ends_with("/vllm") || arg.contains("vllm.entrypoints")
-}
-
-/// Whether a process command line is an SGLang server rather than something
-/// that merely mentions it. The recognized launch forms:
-///   * `python -m sglang.launch_server ...` (the documented one)
-///   * the `sglang` CLI (`sglang serve ...`)
-///
-/// Deliberately token-precise like the vLLM matcher: a proxy named
-/// "sglang-sidecar" runs nothing until a command line proves otherwise, and
-/// an argument that merely contains "sglang" (a path, a config file) is not
-/// the server itself.
+/// The served model named on a pre-joined command line, read the way the
+/// engine type's own launcher spells it.
 #[cfg(any(target_os = "linux", test))]
-fn is_sglang_process(command: &str) -> bool {
-    command.split_whitespace().any(sglang_arg_is_server)
-}
-
-/// The single-argument form of the matcher (see `vllm_arg_is_server`).
-fn sglang_arg_is_server(arg: &str) -> bool {
-    arg == "sglang"
-        || arg.ends_with("/sglang")
-        || arg.contains("sglang.launch_server")
-        || arg.contains("sglang.srt")
-}
-
-/// Whether a process's argv proves it is a server of the given engine type.
-fn cmd_proves_engine(cmd: &[std::ffi::OsString], engine_type: &EngineType) -> bool {
-    let arg_is_server: fn(&str) -> bool = match engine_type {
-        EngineType::Vllm => vllm_arg_is_server,
-        EngineType::Sglang => sglang_arg_is_server,
-    };
-    cmd.iter()
-        .any(|arg| arg.to_str().is_some_and(arg_is_server))
+fn parse_model_for(engine_type: &EngineType, cmd: &str) -> Option<String> {
+    match engine_type {
+        EngineType::Vllm => parse_model_from_command_str(cmd),
+        EngineType::Sglang => parse_sglang_model_from_command_str(cmd),
+    }
 }
 
 /// What a container's declared name, image and command say about which
 /// engine (if any) it runs, and how far to trust that.
 #[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq)]
 struct ContainerClass {
     engine_type: EngineType,
     /// The image or command named this engine type — trusted as-is. A
     /// name-only match is not: an operator can name anything, so such a
     /// container must additionally be seen *running* the engine process.
     strong_signal: bool,
-    is_process: fn(&str) -> bool,
-    parse_model: fn(&str) -> Option<String>,
-    default_port: u16,
 }
 
-/// Rank the signals by how much they say: the **image** is what was pulled
-/// to run here, the command is what the entrypoint says, and the **name**
-/// is what somebody typed. An `lmsysorg/sglang` image whose command string
-/// mentions vLLM (an env var, a model path) is SGLang — reading the command
-/// first would call it vLLM, and vLLM's `/health` probe would not notice.
-/// Ties without an image signal go to vLLM: no one builds a "vllm-sglang"
-/// image on purpose, and the mismatched container is more plausibly a vLLM
-/// deployment with sglang in a sidecar name than the reverse.
+/// Rank the signals by how much they say:
+///   1. the **image** is what was pulled to run here — when it names exactly
+///      one engine, that engine. An `lmsysorg/sglang` image whose command
+///      mentions vLLM (an env var, a model path) is SGLang.
+///   2. the **command** is what the entrypoint runs — its launch form, read
+///      like a host process's (the first argument naming a server decides),
+///      so `python3 -m sglang.launch_server --model-path /models/x-vllm-awq`
+///      is SGLang. Failing a launch form, a command that mentions exactly
+///      one engine anywhere (a shell wrapper's quoted `"vllm serve ..."`)
+///      still names it.
+///   3. the **name** is what somebody typed — a weak signal the container's
+///      processes must confirm.
 ///
-/// Only reachable from the Linux Docker path in normal builds — it names the
-/// Linux-only command parsers — but the unit tests exercise it on every
-/// platform, hence the `test` cfg.
+/// What stays tied — both engines named and no launch form to decide — goes
+/// to vLLM: no one builds a "vllm-sglang" image on purpose, and the
+/// mismatched container is more plausibly a vLLM deployment with sglang in a
+/// sidecar name than the reverse.
+///
+/// Only reachable from the Linux Docker path in normal builds, but the unit
+/// tests exercise it on every platform, hence the `test` cfg.
 #[cfg(any(target_os = "linux", test))]
 fn classify_container(names: &[String], image: &str, command: &str) -> Option<ContainerClass> {
-    let named = |needle: &str| names.iter().any(|n| n.to_lowercase().contains(needle));
-    let (image_vllm, image_sglang) = (image.contains("vllm"), image.contains("sglang"));
-    let (cmd_vllm, cmd_sglang) = (command.contains("vllm"), command.contains("sglang"));
+    let mentions = |text: &str| (text.contains("vllm"), text.contains("sglang"));
+    let class = |engine_type, strong_signal| {
+        Some(ContainerClass {
+            engine_type,
+            strong_signal,
+        })
+    };
 
-    let is_vllm = (image_vllm || cmd_vllm || named("vllm")) && !(image_sglang && !image_vllm);
-    if is_vllm {
-        return Some(ContainerClass {
-            engine_type: EngineType::Vllm,
-            strong_signal: image_vllm || cmd_vllm,
-            is_process: is_vllm_process,
-            parse_model: parse_model_from_command_str,
-            default_port: VLLM_DEFAULT_PORT,
-        });
+    match mentions(image) {
+        (true, false) => return class(EngineType::Vllm, true),
+        (false, true) => return class(EngineType::Sglang, true),
+        _ => {}
     }
-    if image_sglang || cmd_sglang || named("sglang") {
-        return Some(ContainerClass {
-            engine_type: EngineType::Sglang,
-            strong_signal: image_sglang || cmd_sglang,
-            is_process: is_sglang_process,
-            parse_model: parse_sglang_model_from_command_str,
-            default_port: SGLANG_DEFAULT_PORT,
-        });
+    if let Some(engine_type) = engine_of_command(command.split_whitespace()) {
+        return class(engine_type, true);
     }
-    None
+    match mentions(command) {
+        (false, true) => return class(EngineType::Sglang, true),
+        (true, _) => return class(EngineType::Vllm, true),
+        (false, false) => {}
+    }
+    // An image naming both engines, with a command naming neither: the tie.
+    if image.contains("vllm") {
+        return class(EngineType::Vllm, true);
+    }
+
+    let named = |needle: &str| names.iter().any(|n| n.to_lowercase().contains(needle));
+    if named("vllm") {
+        class(EngineType::Vllm, false)
+    } else if named("sglang") {
+        class(EngineType::Sglang, false)
+    } else {
+        None
+    }
 }
 
 /// The endpoint to probe a container's vLLM on, and whether the port had to be
@@ -251,70 +278,19 @@ fn docker_endpoint(port: Option<&str>, default_port: u16) -> (String, bool) {
 // ---------------------------------------------------------------------------
 
 fn detect_by_process(sys: &sysinfo::System) -> Vec<DetectedEngine> {
-    let mut detected: Vec<DetectedEngine> = Vec::new();
-
-    for &(binary, ref engine_type, default_endpoint) in ENGINE_BINARIES {
-        // Direct binary match (e.g. process named "vllm"), but only where
-        // the command line also proves a server. SGLang's child processes
-        // rename themselves (`setproctitle` → `sglang::scheduler`,
-        // `sglang::detokenizer`), and a substring name match finds those
-        // while the real server is `python3 -m sglang.launch_server` —
-        // children carry neither the launch flags nor the serving `--port`,
-        // so a name-only match would hide the server and detect the engine
-        // on the default port instead of the real one.
-        let mut procs: Vec<_> = sys
-            .processes_by_name(OsStr::new(binary))
-            .filter(|p| cmd_proves_engine(p.cmd(), engine_type))
-            .collect();
-
-        // Union the command-line scan, which covers the python-launched
-        // forms — the server whose name is `python3` only ever shows up
-        // here:
-        //   `python3 /usr/local/bin/vllm serve ...` (Docker host-networking)
-        //   `python -m vllm.entrypoints.openai.api_server ...`
-        //   `python3 -m sglang.launch_server ...`
-        let engine_procs: Vec<_> = sys
-            .processes()
-            .values()
-            .filter(|p| cmd_proves_engine(p.cmd(), engine_type))
-            .collect();
-        for p in engine_procs {
-            if !procs.iter().any(|q| q.pid() == p.pid()) {
-                procs.push(p);
-            }
-        }
-
-        // Emit one DetectedEngine per distinct endpoint. Multi-instance native
-        // setups (three `vllm serve --port 8000/8001/8002` processes) need each
-        // port to surface as its own engine rather than collapsing to the first.
-        let mut seen_endpoints: HashMap<String, usize> = HashMap::new();
-        for p in &procs {
-            if p.cmd().is_empty() {
-                continue;
-            }
-            let endpoint = parse_endpoint_from_args(p.cmd(), default_endpoint)
-                .unwrap_or_else(|| default_endpoint.to_string());
-            let served_model = match engine_type {
-                EngineType::Vllm => parse_model_from_args(p.cmd()),
-                EngineType::Sglang => parse_sglang_model_from_args(p.cmd()),
-            };
-            let pid = p.pid().as_u32();
-            match seen_endpoints.get(&endpoint) {
-                Some(&slot) => detected[slot].pids.push(pid),
-                None => {
-                    seen_endpoints.insert(endpoint.clone(), detected.len());
-                    detected.push(DetectedEngine {
-                        engine_type: engine_type.clone(),
-                        endpoint,
-                        deployment_mode: DeploymentMode::Native,
-                        served_model,
-                        pids: vec![pid],
-                        container_id: None,
-                    });
-                }
-            }
-        }
-    }
+    // Every process is judged by its command line alone — not by its name:
+    // SGLang's child processes rename themselves (`setproctitle` →
+    // `sglang::scheduler`, `sglang::detokenizer`) and carry neither the
+    // launch flags nor the serving `--port`, while the server itself is often
+    // named `python3`. Sorted by PID so the candidates come out in a stable
+    // order.
+    let mut processes: Vec<(u32, &[OsString])> = sys
+        .processes()
+        .iter()
+        .map(|(pid, p)| (pid.as_u32(), p.cmd()))
+        .collect();
+    processes.sort_unstable_by_key(|&(pid, _)| pid);
+    let mut detected = engines_from_processes(processes);
 
     // vLLM's API-server process rarely holds the CUDA context itself — the
     // engine-core / tensor-parallel worker child processes do — so NVML's
@@ -331,6 +307,48 @@ fn detect_by_process(sys: &sysinfo::System) -> Vec<DetectedEngine> {
         }
     }
 
+    detected
+}
+
+/// One candidate per engine endpoint from a host's `(pid, argv)` list.
+///
+/// Each process is at most one engine — the one its command line launches
+/// (`engine_of_process`) — so a process is never polled as both: an SGLang
+/// server with `/data/vllm` among its arguments is not also a vLLM candidate
+/// whose `/health` probe would run a generation on SGLang every second. One
+/// candidate per distinct endpoint, too: multi-instance native setups (three
+/// `vllm serve --port 8000/8001/8002` processes) surface each port as its
+/// own engine rather than collapsing to the first.
+fn engines_from_processes<'a>(
+    processes: impl IntoIterator<Item = (u32, &'a [OsString])>,
+) -> Vec<DetectedEngine> {
+    let mut detected: Vec<DetectedEngine> = Vec::new();
+    let mut seen_endpoints: HashMap<(EngineType, String), usize> = HashMap::new();
+    for (pid, cmd) in processes {
+        let Some(engine_type) = engine_of_process(cmd) else {
+            continue;
+        };
+        let default_endpoint = format!("http://localhost:{}", default_port(&engine_type));
+        let endpoint = parse_endpoint_from_args(cmd, &default_endpoint).unwrap_or(default_endpoint);
+        let served_model = match engine_type {
+            EngineType::Vllm => parse_model_from_args(cmd),
+            EngineType::Sglang => parse_sglang_model_from_args(cmd),
+        };
+        match seen_endpoints.get(&(engine_type.clone(), endpoint.clone())) {
+            Some(&slot) => detected[slot].pids.push(pid),
+            None => {
+                seen_endpoints.insert((engine_type.clone(), endpoint.clone()), detected.len());
+                detected.push(DetectedEngine {
+                    engine_type,
+                    endpoint,
+                    deployment_mode: DeploymentMode::Native,
+                    served_model,
+                    pids: vec![pid],
+                    container_id: None,
+                });
+            }
+        }
+    }
     detected
 }
 
@@ -651,11 +669,10 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         ) else {
             continue;
         };
-        let engine_type = class.engine_type;
-        let strong_signal = class.strong_signal;
-        let is_process = class.is_process;
-        let parse_model = class.parse_model;
-        let default_port = class.default_port;
+        let ContainerClass {
+            engine_type,
+            strong_signal,
+        } = class;
 
         // 1. Try port from Docker port mappings (works for -p / port-forwarding)
         let mapped_port = container
@@ -666,7 +683,7 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         // 2. Try port + model from the container's own command string
         let container_cmd = container.command.as_deref().unwrap_or_default();
         let cmd_port = parse_port_from_command_str(container_cmd);
-        let cmd_model = parse_model(container_cmd);
+        let cmd_model = parse_model_for(&engine_type, container_cmd);
 
         let port = mapped_port.map(|p| p.to_string()).or(cmd_port);
 
@@ -695,7 +712,7 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
                                     pids.push(pid);
                                 }
                                 let line = row.join(" ");
-                                if is_process(&line) {
+                                if runs_engine(&line, &engine_type) {
                                     saw_engine_process = true;
                                 }
                                 if found_port.is_none() {
@@ -709,7 +726,7 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
                                     }
                                 }
                                 if found_model.is_none() {
-                                    if let Some(m) = parse_model(&line) {
+                                    if let Some(m) = parse_model_for(&engine_type, &line) {
                                         tracing::debug!(
                                             "Docker top: found model {} in: {}",
                                             m,
@@ -752,7 +769,7 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         // wrong guess costs one request and corrects itself, while a container
         // dropped for having no port is invisible to the dashboard for good —
         // engine, metrics and logs alike.
-        let (endpoint, guessed) = docker_endpoint(port.as_deref(), default_port);
+        let (endpoint, guessed) = docker_endpoint(port.as_deref(), default_port(&engine_type));
         tracing::debug!(
             "Docker engine candidate: image={}, endpoint={}{}, model={:?}",
             container.image.as_deref().unwrap_or("?"),
@@ -761,7 +778,7 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
             served_model,
         );
         detected.push(DetectedEngine {
-            engine_type: engine_type.clone(),
+            engine_type,
             endpoint,
             deployment_mode: DeploymentMode::Docker,
             served_model,
@@ -1060,12 +1077,17 @@ mod tests {
 
     #[test]
     fn a_vllm_server_process_is_recognized_in_its_several_launch_forms() {
-        assert!(is_vllm_process(
-            "/usr/bin/python3 /usr/local/bin/vllm serve Qwen/Qwen3-8B"
+        assert!(runs_engine(
+            "/usr/bin/python3 /usr/local/bin/vllm serve Qwen/Qwen3-8B",
+            &EngineType::Vllm
         ));
-        assert!(is_vllm_process("vllm serve mistralai/Mistral-7B"));
-        assert!(is_vllm_process(
-            "python -m vllm.entrypoints.openai.api_server --port 8001"
+        assert!(runs_engine(
+            "vllm serve mistralai/Mistral-7B",
+            &EngineType::Vllm
+        ));
+        assert!(runs_engine(
+            "python -m vllm.entrypoints.openai.api_server --port 8001",
+            &EngineType::Vllm
         ));
     }
 
@@ -1073,10 +1095,16 @@ mod tests {
     fn a_process_that_merely_mentions_vllm_is_not_a_server() {
         // What the container-name signal has to be protected against: a proxy
         // or a shell that has the word in its arguments but serves nothing.
-        assert!(!is_vllm_process("nginx: master process /usr/sbin/nginx"));
-        assert!(!is_vllm_process("sleep infinity"));
-        assert!(!is_vllm_process("/bin/sh -c echo starting vllm-proxy"));
-        assert!(!is_vllm_process("tail -f /var/log/vllm.log"));
+        assert!(!runs_engine(
+            "nginx: master process /usr/sbin/nginx",
+            &EngineType::Vllm
+        ));
+        assert!(!runs_engine("sleep infinity", &EngineType::Vllm));
+        assert!(!runs_engine(
+            "/bin/sh -c echo starting vllm-proxy",
+            &EngineType::Vllm
+        ));
+        assert!(!runs_engine("tail -f /var/log/vllm.log", &EngineType::Vllm));
     }
 
     #[test]
@@ -1116,7 +1144,6 @@ mod tests {
         .expect("classified");
         assert!(matches!(class.engine_type, EngineType::Sglang));
         assert!(class.strong_signal);
-        assert_eq!(class.default_port, SGLANG_DEFAULT_PORT);
 
         // Without image evidence, vLLM still wins a mixed command.
         let class = classify_container(&[], "", "vllm serve --env SGLANG_MODE=1").expect("vllm");
@@ -1132,65 +1159,174 @@ mod tests {
         assert!(classify_container(&["sidecar".to_string()], "", "nginx").is_none());
     }
 
+    /// Without image evidence, an SGLang launch command wins: a vLLM-ish
+    /// container name or a model path that merely contains "vllm" does not
+    /// turn it into vLLM — which would make a weak vLLM candidate dropped by
+    /// `docker top`, or a strong one polled on the wrong engine's routes.
+    #[test]
+    fn an_sglang_launch_command_beats_a_vllm_name_or_path() {
+        let sglang = Some(ContainerClass {
+            engine_type: EngineType::Sglang,
+            strong_signal: true,
+        });
+        assert_eq!(
+            classify_container(
+                &["qwen-vllm-compat".to_string()],
+                "my/inference",
+                "python3 -m sglang.launch_server --port 30000",
+            ),
+            sglang
+        );
+        assert_eq!(
+            classify_container(
+                &[],
+                "my/inference",
+                "python3 -m sglang.launch_server --model-path /models/x-vllm-awq",
+            ),
+            sglang
+        );
+        // And the reverse: a vLLM launch with an SGLang path stays vLLM.
+        assert_eq!(
+            classify_container(&[], "", "vllm serve /models/sglang-distill"),
+            Some(ContainerClass {
+                engine_type: EngineType::Vllm,
+                strong_signal: true,
+            })
+        );
+    }
+
     #[test]
     fn a_renamed_sglang_child_is_not_mistaken_for_the_server() {
         // `setproctitle` children name themselves `sglang::scheduler` and
         // `sglang::detokenizer`; their argv proves no server and carries no
         // `--port`. Only the launching process may set the endpoint.
-        assert!(cmd_proves_engine(
-            &argv("python3 -m sglang.launch_server --port 30001"),
-            &EngineType::Sglang
-        ));
-        assert!(cmd_proves_engine(
-            &argv("/usr/local/bin/sglang serve Qwen/Qwen2.5-0.5B"),
-            &EngineType::Sglang
-        ));
-        assert!(!cmd_proves_engine(
-            &argv("sglang::scheduler"),
-            &EngineType::Sglang
-        ));
-        assert!(!cmd_proves_engine(
-            &argv("sglang::detokenizer"),
-            &EngineType::Sglang
-        ));
+        let sglang = Some(EngineType::Sglang);
+        assert_eq!(
+            engine_of_process(&argv("python3 -m sglang.launch_server --port 30001")),
+            sglang
+        );
+        assert_eq!(
+            engine_of_process(&argv("/usr/local/bin/sglang serve Qwen/Qwen2.5-0.5B")),
+            sglang
+        );
+        assert_eq!(engine_of_process(&argv("sglang::scheduler")), None);
+        assert_eq!(engine_of_process(&argv("sglang::detokenizer")), None);
         // The same for vLLM children, and a model path containing the word
         // must not match (single-argument precision).
-        assert!(cmd_proves_engine(
-            &argv("vllm serve google/gemma-3-4b --port 8001"),
-            &EngineType::Vllm
-        ));
-        assert!(!cmd_proves_engine(
-            &argv("tail -f /var/log/vllm.log"),
-            &EngineType::Vllm
-        ));
+        assert_eq!(
+            engine_of_process(&argv("vllm serve google/gemma-3-4b --port 8001")),
+            Some(EngineType::Vllm)
+        );
+        assert_eq!(engine_of_process(&argv("tail -f /var/log/vllm.log")), None);
         // One argument holding the string whole: per-argument precision
         // means a path containing the word is not the binary being run.
         let whole_arg = ["python3", "serve", "/models/my vllm model"].map(std::ffi::OsString::from);
-        assert!(!cmd_proves_engine(&whole_arg, &EngineType::Vllm));
+        assert_eq!(engine_of_process(&whole_arg), None);
+    }
+
+    /// A process is at most one engine. An SGLang server with a vLLM path
+    /// among its arguments used to match both scans and become two
+    /// candidates on its port — and the vLLM one polled SGLang's `/health`,
+    /// a one-token generation, every second.
+    #[test]
+    fn a_process_is_detected_as_one_engine_only() {
+        let sglang = argv("python3 -m sglang.launch_server --download-dir /data/vllm --port 30000");
+        let vllm = argv("vllm serve /models/sglang-distill --port 8001");
+        let detected = engines_from_processes([(10, sglang.as_slice()), (20, vllm.as_slice())]);
+        let found: Vec<_> = detected
+            .iter()
+            .map(|d| (d.engine_type.clone(), d.endpoint.as_str(), d.pids.clone()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (EngineType::Sglang, "http://localhost:30000", vec![10]),
+                (EngineType::Vllm, "http://localhost:8001", vec![20]),
+            ]
+        );
+    }
+
+    /// `--host` without `--port` still serves on the engine's own default
+    /// port: SGLang's 30000, never vLLM's 8000.
+    #[test]
+    fn a_host_without_a_port_keeps_the_engines_default_port() {
+        let sglang = argv("python3 -m sglang.launch_server --host 0.0.0.0");
+        let vllm = argv("vllm serve Qwen/Qwen3-8B --host 0.0.0.0");
+        let endpoints: Vec<_> =
+            engines_from_processes([(1, sglang.as_slice()), (2, vllm.as_slice())])
+                .into_iter()
+                .map(|d| d.endpoint)
+                .collect();
+        assert_eq!(
+            endpoints,
+            vec!["http://localhost:30000", "http://localhost:8000"]
+        );
+    }
+
+    /// Several processes of one server on one endpoint (workers forked with
+    /// the launch argv) are one engine, holding every PID.
+    #[test]
+    fn processes_on_one_endpoint_are_one_engine() {
+        let a = argv("vllm serve m --port 8000");
+        let b = argv("vllm serve m --port 8000");
+        let c = argv("vllm serve m --port 8001");
+        let detected =
+            engines_from_processes([(1, a.as_slice()), (2, b.as_slice()), (3, c.as_slice())]);
+        assert_eq!(detected.len(), 2);
+        assert_eq!(detected[0].pids, vec![1, 2]);
+        assert_eq!(detected[1].pids, vec![3]);
     }
 
     #[test]
     fn a_sglang_server_process_is_recognized_in_its_launch_forms() {
-        assert!(is_sglang_process(
-            "python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B --port 30001"
+        assert!(runs_engine(
+            "python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B --port 30001",
+            &EngineType::Sglang
         ));
-        assert!(is_sglang_process(
-            "sglang serve --model Qwen/Qwen2.5-3B-Instruct"
+        assert!(runs_engine(
+            "sglang serve --model Qwen/Qwen2.5-3B-Instruct",
+            &EngineType::Sglang
         ));
-        assert!(is_sglang_process(
-            "/usr/local/bin/sglang serve --model-path=google/gemma-3-4b"
+        assert!(runs_engine(
+            "/usr/local/bin/sglang serve --model-path=google/gemma-3-4b",
+            &EngineType::Sglang
         ));
-        assert!(is_sglang_process(
-            "python -m sglang.srt.server --host 127.0.0.1 --port 30000"
+        assert!(runs_engine(
+            "python -m sglang.srt.server --host 127.0.0.1 --port 30000",
+            &EngineType::Sglang
         ));
     }
 
     #[test]
     fn a_process_that_merely_mentions_sglang_is_not_a_server() {
-        assert!(!is_sglang_process("nginx: master process /usr/sbin/nginx"));
-        assert!(!is_sglang_process("tail -f /var/log/sglang.log"));
-        assert!(!is_sglang_process("/bin/sh -c echo starting sglang-proxy"));
-        assert!(!is_sglang_process("sleep infinity"));
+        assert!(!runs_engine(
+            "nginx: master process /usr/sbin/nginx",
+            &EngineType::Sglang
+        ));
+        assert!(!runs_engine(
+            "tail -f /var/log/sglang.log",
+            &EngineType::Sglang
+        ));
+        assert!(!runs_engine(
+            "/bin/sh -c echo starting sglang-proxy",
+            &EngineType::Sglang
+        ));
+        assert!(!runs_engine("sleep infinity", &EngineType::Sglang));
+    }
+
+    /// A container's command is read with its engine's own model flags:
+    /// `--model-path` for SGLang, `--model` or `serve <id>` for vLLM.
+    #[test]
+    fn a_container_command_is_read_with_its_engines_model_flags() {
+        let cmd = "python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000";
+        assert_eq!(
+            parse_model_for(&EngineType::Sglang, cmd).as_deref(),
+            Some("Qwen/Qwen3-8B")
+        );
+        assert_eq!(
+            parse_model_for(&EngineType::Vllm, "vllm serve Qwen/Qwen3-8B").as_deref(),
+            Some("Qwen/Qwen3-8B")
+        );
     }
 
     #[test]
