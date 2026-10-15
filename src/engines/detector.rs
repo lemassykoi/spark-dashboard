@@ -1,7 +1,7 @@
-use super::{DeploymentMode, EngineType};
+use super::common::EngineHttp;
+use super::{ApiKeyResolver, DeploymentMode, EngineType};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::time::Duration;
 
 /// A candidate engine discovered by the detection layers.
 #[derive(Clone, Debug)]
@@ -51,6 +51,7 @@ fn default_port(engine_type: &EngineType) -> u16 {
 pub async fn detect_engines(
     sys: &sysinfo::System,
     client: &reqwest::Client,
+    api_keys: &ApiKeyResolver,
 ) -> Vec<DetectedEngine> {
     // Layer 1: process scan
     let mut candidates = detect_by_process(sys);
@@ -62,7 +63,12 @@ pub async fn detect_engines(
     // Layer 3: API health probe -- verify each candidate is actually reachable
     let mut verified = Vec::new();
     for candidate in candidates {
-        if probe_engine(client, &candidate).await {
+        let http = EngineHttp::new(
+            client.clone(),
+            candidate.endpoint.clone(),
+            api_keys.resolve(&candidate.endpoint),
+        );
+        if probe_engine(&http, &candidate.engine_type).await {
             verified.push(candidate);
         }
     }
@@ -831,56 +837,36 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
 // Layer 3: API health probe
 // ---------------------------------------------------------------------------
 
-/// Verify that a candidate engine's API is actually responding.
-async fn probe_engine(client: &reqwest::Client, candidate: &DetectedEngine) -> bool {
-    let timeout = Duration::from_secs(2);
-
-    match candidate.engine_type {
-        EngineType::Vllm => {
-            // GET /health -- 200 = healthy
-            client
-                .get(format!("{}/health", candidate.endpoint))
-                .timeout(timeout)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-        }
+/// Verify that a candidate engine's API is actually responding, and is the
+/// engine type it was detected as. Every request carries the endpoint's
+/// configured API key, as the adapter's own requests do.
+async fn probe_engine(http: &EngineHttp, engine_type: &EngineType) -> bool {
+    let answers = |path: &'static str| async move { http.get(path).send().await.ok() };
+    match engine_type {
+        // GET /health -- 200 = healthy
+        EngineType::Vllm => answers("/health")
+            .await
+            .is_some_and(|r| r.status().is_success()),
         EngineType::Sglang => {
-            // SGLang answers Ollama-compatible routes too, so "a route exists"
-            // proves little — but `/ready` is SGLang's own cheap readiness
-            // probe (vLLM has no such route, and with an API key it answers
-            // 401 there rather than 200), and the server-info route is
-            // SGLang's own: a 200 (open) or 401 (gated — the route exists)
-            // says SGLang, a 404 on both spellings says this is not SGLang.
-            // `/server_info` is the canonical route; `/get_server_info` is its
-            // deprecated alias, checked so old servers keep working and the
-            // probe survives the alias's eventual removal.
-            let ready = client
-                .get(format!("{}/ready", candidate.endpoint))
-                .timeout(timeout)
-                .send()
+            // SGLang answers Ollama-compatible routes too, so "a route
+            // exists" proves little — but `/ready` and `/model_info` are
+            // SGLang's own: vLLM serves neither. Both are answered by the
+            // tokenizer manager without a round trip through the scheduler,
+            // so probing every detection tick costs the engine nothing —
+            // unlike `/server_info`, which collects every scheduler's
+            // internal state, or `/health`, which runs a generation.
+            // `/ready` must say ready; `/model_info` must exist — a 200, or
+            // a 401 when the engine has an API key the dashboard lacks (the
+            // route is there); only a 404 says this is not SGLang.
+            if !answers("/ready")
                 .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            if !ready {
+                .is_some_and(|r| r.status().is_success())
+            {
                 return false;
             }
-            let info_route_exists = |route: &str| {
-                let client = client.clone();
-                let endpoint = candidate.endpoint.clone();
-                let route = route.to_string();
-                async move {
-                    client
-                        .get(format!("{}{}", endpoint, route))
-                        .timeout(timeout)
-                        .send()
-                        .await
-                        .map(|r| r.status().as_u16() != 404)
-                        .unwrap_or(false)
-                }
-            };
-            info_route_exists("/server_info").await || info_route_exists("/get_server_info").await
+            answers("/model_info")
+                .await
+                .is_some_and(|r| r.status() != reqwest::StatusCode::NOT_FOUND)
         }
     }
 }
@@ -897,57 +883,57 @@ mod tests {
         parts.iter().map(OsString::from).collect()
     }
 
+    /// The SGLang probe identifies the engine through its own cheap
+    /// routes, `/ready` then `/model_info` — each asked with exactly one
+    /// slash (a doubled one was answered 404, which rejected every real
+    /// SGLang server) and with the endpoint's API key.
     #[tokio::test]
-    async fn the_sglang_probe_asks_for_its_routes_with_exactly_one_slash() {
-        // Regression: the route strings carry their own leading slash, and a
-        // format that added another asked SGLang for `//server_info` — which
-        // it answers 404, so the probe rejected every real SGLang server.
-        // Live-verified against a running server; pinned here so the URL
-        // shape cannot regress silently again.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let paths: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let accept_paths = paths.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let paths = accept_paths.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let path = String::from_utf8_lossy(&buf[..n])
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("")
-                        .to_string();
-                    paths.lock().unwrap().push(path);
-                    let _ = sock
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                        )
-                        .await;
-                });
-            }
-        });
-        let candidate = DetectedEngine {
-            engine_type: EngineType::Sglang,
-            endpoint: format!("http://127.0.0.1:{}", port),
-            deployment_mode: DeploymentMode::Native,
-            served_model: None,
-            pids: vec![],
-            container_id: None,
-        };
-        assert!(probe_engine(&reqwest::Client::new(), &candidate).await);
-        assert_eq!(
-            paths.lock().unwrap().clone(),
-            vec!["/ready".to_string(), "/server_info".to_string()],
-        );
+    async fn the_sglang_probe_asks_its_cheap_routes_with_the_api_key() {
+        use super::super::test_server::TestServer;
+        let server = TestServer::start(|_| (200, String::new())).await;
+        let http = EngineHttp::new(reqwest::Client::new(), server.url.clone(), Some("k".into()));
+        assert!(probe_engine(&http, &EngineType::Sglang).await);
+
+        let asked = server.requests();
+        let paths: Vec<_> = asked.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["/ready", "/model_info"]);
+        assert!(asked
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some("Bearer k")));
+    }
+
+    /// `/model_info` answering 401 is SGLang with an API key the dashboard
+    /// does not hold — the route exists; a 404 is some other server.
+    #[tokio::test]
+    async fn the_sglang_probe_rejects_a_server_without_its_routes() {
+        use super::super::test_server::TestServer;
+        for (model_info, is_sglang) in [(401, true), (404, false)] {
+            let server = TestServer::start(move |r| match r.path.as_str() {
+                "/ready" => (200, String::new()),
+                _ => (model_info, String::new()),
+            })
+            .await;
+            let http = EngineHttp::new(reqwest::Client::new(), server.url.clone(), None);
+            assert_eq!(
+                probe_engine(&http, &EngineType::Sglang).await,
+                is_sglang,
+                "/model_info answering {model_info}"
+            );
+        }
+    }
+
+    /// The vLLM probe carries the key too, like every request its adapter
+    /// makes.
+    #[tokio::test]
+    async fn the_vllm_probe_sends_the_api_key() {
+        use super::super::test_server::TestServer;
+        let server = TestServer::start(|_| (200, String::new())).await;
+        let http = EngineHttp::new(reqwest::Client::new(), server.url.clone(), Some("k".into()));
+        assert!(probe_engine(&http, &EngineType::Vllm).await);
+        let asked = server.requests();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].path, "/health");
+        assert_eq!(asked[0].authorization.as_deref(), Some("Bearer k"));
     }
 
     #[test]

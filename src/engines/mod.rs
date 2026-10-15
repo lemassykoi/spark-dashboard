@@ -729,7 +729,7 @@ pub async fn engine_collector_loop(
                 // Refresh process list for scanning
                 sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-                let detected = detector::detect_engines(&sys, &client).await;
+                let detected = detector::detect_engines(&sys, &client, &api_keys).await;
 
                 // Add newly detected engines
                 for d in &detected {
