@@ -340,10 +340,10 @@ fn engine_metrics(
 
     // Speculative decoding. SGLang exposes acceptance as gauges
     // (`spec_accept_rate` is the accepted/drafted ratio of recent verify
-    // rounds, `spec_accept_length` the mean accepted tokens per round)
-    // and has no draft/accept token counters — so the cumulative fields
-    // and the delta-derived live rate stay `None` and the acceptance
-    // figures come straight from the gauges.
+    // rounds, `spec_accept_length` the mean tokens a round emits) and has
+    // no draft/accept token counters — so the cumulative fields and the
+    // delta-derived live rate stay `None` and the acceptance figures come
+    // from the gauges.
     //
     // A server without a drafter logs both gauges as `0` rather than
     // omitting them, so a configured drafter is judged by a nonzero
@@ -351,8 +351,18 @@ fn engine_metrics(
     // and a panel permanently showing 0% would be the worse of the two
     // readings. Nonzero length is the same configured signal the
     // frontend reads off vLLM's optional counters.
+    //
+    // The two engines count the length differently. SGLang's
+    // `spec_accept_length` is generated tokens per verify round
+    // (`num_correct_drafts + batch_size` over the rounds, in
+    // `batch_result_processor.py`): the accepted drafts plus the one token
+    // the target model emits itself every round, the bonus. The field is
+    // vLLM's accepted/drafts — accepted draft tokens per draft, the tile's
+    // "tok/draft" — which leaves the bonus out. Subtracting it reports the
+    // same quantity (ADR-0004), instead of a figure one higher. (UNO, which
+    // emits two non-draft tokens a round, would still read one high.)
     let acceptance = spec_acceptance(parsed);
-    let spec_decode_mean_acceptance_length = acceptance.map(|(length, _)| length);
+    let spec_decode_mean_acceptance_length = acceptance.map(|(length, _)| (length - 1.0).max(0.0));
     let spec_decode_acceptance_rate = acceptance.and_then(|(_, rate)| rate).map(|v| v * 100.0);
 
     // Percentiles, goodput and shipped buckets from the request-level
@@ -447,6 +457,11 @@ mod tests {
 
     fn parsed_real() -> ParsedMetrics {
         parse_sglang(REAL).expect("fixture parses")
+    }
+
+    fn assert_close(got: Option<f64>, want: f64) {
+        let got = got.expect("a value");
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
     }
 
     /// `engine_metrics` for a scrape no baseline has been subtracted from —
@@ -551,7 +566,7 @@ mod tests {
         assert_eq!(live.active_requests, Some(1));
         assert_eq!(blank.active_requests, Some(1));
         assert_eq!(blank.spec_decode_acceptance_rate, Some(60.0));
-        assert_eq!(blank.spec_decode_mean_acceptance_length, Some(2.8));
+        assert_close(blank.spec_decode_mean_acceptance_length, 1.8);
     }
 
     #[test]
@@ -564,7 +579,9 @@ mod tests {
         assert_eq!(m.queued_requests, Some(0));
         assert!((m.kv_cache_percent.unwrap() - 38.13953488372093).abs() < 1e-9);
         assert_eq!(m.spec_decode_acceptance_rate, Some(60.0));
-        assert_eq!(m.spec_decode_mean_acceptance_length, Some(2.8));
+        // The fixture's `spec_accept_length` is 2.8 tokens a round, the bonus
+        // included: 1.8 accepted draft tokens per draft.
+        assert_close(m.spec_decode_mean_acceptance_length, 1.8);
         assert!(m.total_requests.unwrap() > 0);
         assert!(m.ttft_ms.unwrap() > 0.0);
         assert!(m.itl_percentiles.unwrap().p95_ms.unwrap() > 0.0);
@@ -733,7 +750,7 @@ sglang:spec_accept_rate{dp_rank=\"0\",model_name=\"m\",tp_rank=\"0\"} 0.8
         assert_eq!(m.queued_requests, Some(3));
         let kv = m.kv_cache_percent.expect("kv");
         assert!((kv - 40.0).abs() < 1e-9, "mean of 50% and 30%, got {kv}");
-        assert_eq!(m.spec_decode_mean_acceptance_length, Some(2.5));
+        assert_eq!(m.spec_decode_mean_acceptance_length, Some(1.5));
         let rate = m.spec_decode_acceptance_rate.expect("rate");
         assert!(
             (rate - 60.0).abs() < 1e-9,
@@ -758,7 +775,7 @@ sglang:spec_accept_rate{dp_rank=\"1\"} 0.0
             RateInputs::default(),
             false,
         );
-        assert_eq!(m.spec_decode_mean_acceptance_length, Some(3.0));
+        assert_eq!(m.spec_decode_mean_acceptance_length, Some(2.0));
         assert_eq!(m.spec_decode_acceptance_rate, Some(80.0));
     }
 
@@ -945,5 +962,26 @@ sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",role=\"decode\"} 4
             logged.contains("configure a provider API key"),
             "warning logged: {logged}"
         );
+    }
+
+    /// SGLang's accept length counts the token the target model emits every
+    /// verify round; the dashboard's figure — vLLM's accepted/drafts — does
+    /// not. A drafter whose drafts are all rejected emits one token a round
+    /// and accepts none.
+    #[test]
+    fn acceptance_length_leaves_out_the_bonus_token() {
+        let body = "\
+# TYPE sglang:spec_accept_length gauge
+sglang:spec_accept_length{tp_rank=\"0\"} 1.0
+# TYPE sglang:spec_accept_rate gauge
+sglang:spec_accept_rate{tp_rank=\"0\"} 0.0
+";
+        let m = map_unbaselined(
+            &parse_sglang(body).expect("parses"),
+            RateInputs::default(),
+            false,
+        );
+        assert_eq!(m.spec_decode_mean_acceptance_length, Some(0.0));
+        assert_eq!(m.spec_decode_acceptance_rate, Some(0.0));
     }
 }
