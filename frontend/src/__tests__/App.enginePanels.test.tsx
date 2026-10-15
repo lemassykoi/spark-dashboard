@@ -1434,4 +1434,80 @@ describe('speculative decoding on an engine that reports gauges instead of count
       within(region('Speculative Decoding')).getByText('This engine has drafted no tokens yet.'),
     ).toBeInTheDocument()
   })
+
+  // An SGLang drafter logs its acceptance gauges as 0 until it verifies a
+  // draft, exactly like a server with none; the backend tells them apart and
+  // reports the configured one as zero draft rounds.
+  it('says an idle SGLang drafter has drafted nothing yet, not that it runs none', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'spec', type: 'engine-spec-decode', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(
+      makeSnapshot(1000, [
+        makeEngine(ALPHA, {
+          engine_type: 'Sglang',
+          metrics: engineMetrics({ spec_decode_drafts_total: 0 }),
+        }),
+      ]),
+    )
+
+    const panel = region('Speculative Decoding')
+    expect(within(panel).getByText('This engine has drafted no tokens yet.')).toBeInTheDocument()
+    expect(
+      within(panel).queryByText('This engine is not using speculative decoding.'),
+    ).not.toBeInTheDocument()
+  })
+
+  it('says an SGLang engine without a drafter is not using speculative decoding', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'spec', type: 'engine-spec-decode', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(
+      makeSnapshot(1000, [
+        makeEngine(ALPHA, { engine_type: 'Sglang', metrics: engineMetrics() }),
+      ]),
+    )
+
+    expect(
+      within(region('Speculative Decoding')).getByText(
+        'This engine is not using speculative decoding.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  // Rounds drafted but no acceptance figure logged yet (SGLang logs its
+  // gauges every few dozen decode steps): the drafter has drafted, so the
+  // panel shows its section, with dashes where a figure has yet to arrive.
+  it('shows the section once an SGLang drafter has drafted, before its gauges log', async () => {
+    const fetchMock = serveConfiguration({
+      document: storedDocument([
+        { id: 'spec', type: 'engine-spec-decode', geometry: { x: 0, y: 0, w: 6, h: 4 } },
+      ]),
+    })
+
+    render(<App />)
+    await configurationSettles(fetchMock)
+    receive(
+      makeSnapshot(1000, [
+        makeEngine(ALPHA, {
+          engine_type: 'Sglang',
+          metrics: engineMetrics({ spec_decode_drafts_total: 12 }),
+        }),
+      ]),
+    )
+
+    const panel = region('Speculative Decoding')
+    expect(within(panel).queryByText(/drafted no tokens yet/)).not.toBeInTheDocument()
+    expect(within(panel).getByText('Accept Len')).toBeInTheDocument()
+  })
 })

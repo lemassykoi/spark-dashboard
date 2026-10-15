@@ -21,19 +21,23 @@ export function EngineSpecDecodePanel({ panel }: PanelContentProps) {
 
   const { metric } = resolution
   const draftTokens = metric('spec_decode_draft_tokens_total')
+  const drafts = metric('spec_decode_drafts_total')
   const acceptanceRate = metric('spec_decode_acceptance_rate')
   const meanAcceptanceLength = metric('spec_decode_mean_acceptance_length')
 
-  // Speculative decoding configured: any of the fields speaks for it. vLLM
-  // answers with the lifetime counters; SGLang reports only the acceptance
-  // gauges and never the counters — gating on the counter alone would tell a
-  // drafter-running SGLang engine it was "not using speculative decoding".
-  // (Both engines report nothing at all when no drafter is configured, so the
-  // negatives below stay honest.)
+  // Speculative decoding is configured when any field speaks for it. vLLM
+  // answers with its lifetime counters, present only with a drafter and at
+  // zero until it drafts. SGLang has no token counters: it answers with its
+  // acceptance gauges once it has verified a draft, and with its draft-round
+  // count — zero until then — whenever it says it runs a drafter. An engine
+  // with none of these fields runs no drafter.
   //
   // The engine is named on a multi-engine host for the same reason its data
   // would be: with two engines on a page, "this engine" does not say which.
-  if (draftTokens === null && acceptanceRate === null && meanAcceptanceLength === null) {
+  const configured = [draftTokens, drafts, acceptanceRate, meanAcceptanceLength].some(
+    (value) => value !== null,
+  )
+  if (!configured) {
     // Under the aggregate the absence speaks for every model at once, so
     // naming one would be wrong.
     if (resolution.status === 'aggregate') {
@@ -43,12 +47,12 @@ export function EngineSpecDecodePanel({ panel }: PanelContentProps) {
     return <PanelNotice>{`${subject} is not using speculative decoding.`}</PanelNotice>
   }
 
-  // Configured and idle: vLLM's counter arrives at zero before the first
-  // draft, and its absence from SGLang's gauges means the same while nothing
-  // has been drafted — in both shapes the drafter exists and the wait is the
-  // truth, so the panel says "not yet" rather than showing an all-dashes
-  // section that looks like a fault.
-  if ((draftTokens === 0 || draftTokens === null) && acceptanceRate === null) {
+  // Configured, and nothing drafted yet: no drafted volume on either
+  // engine's counter and no acceptance figure. The wait is the truth, so the
+  // panel says "not yet" rather than showing an all-dashes section that looks
+  // like a fault.
+  const drafted = (draftTokens ?? 0) > 0 || (drafts ?? 0) > 0
+  if (!drafted && acceptanceRate === null && meanAcceptanceLength === null) {
     if (resolution.status === 'aggregate') {
       return <PanelNotice>No model has drafted a token yet.</PanelNotice>
     }

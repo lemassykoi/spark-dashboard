@@ -10,7 +10,7 @@ use super::{
 use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// The launch flag that turns SGLang's `/metrics` endpoint on. Without it the
@@ -22,6 +22,18 @@ pub const METRICS_LAUNCH_FLAG: &str = "--enable-metrics";
 /// The request counter warmup progress is measured on: every SGLang request
 /// adds one observation to the time-to-first-token histogram, as on vLLM.
 const WARMUP_TRIGGER_KEY: &str = "sglang_time_to_first_token_seconds_count";
+
+/// How long after a failed `/server_info` lookup the adapter asks again.
+const DRAFTER_LOOKUP_RETRY: Duration = Duration::from_secs(60);
+
+/// What the adapter has learned of the server's drafter, and when it last
+/// asked.
+#[derive(Debug, Default)]
+struct DrafterLookup {
+    /// Whether a drafter is configured; `None` until `/server_info` said.
+    configured: Option<bool>,
+    last_attempt: Option<Instant>,
+}
 
 pub struct SglangAdapter {
     /// The endpoint, and the bearer token of a launch with `--api-key`.
@@ -38,6 +50,10 @@ pub struct SglangAdapter {
     /// Prompt tokens/s and its running average.
     prompt_rate: Mutex<CounterRate>,
     warmup: Mutex<WarmupTracker>,
+    /// Whether the server runs a drafter, read once from `/server_info` —
+    /// the only place an idle SGLang drafter shows: its acceptance gauges
+    /// read `0` until it verifies a draft, exactly like a server with none.
+    drafter: Mutex<DrafterLookup>,
     /// Latched by each metrics scrape: true when `/metrics` answered 404 (the
     /// launch without `--enable-metrics`, which never mounts the route),
     /// false when it answered at all. A scrape that could not reach the
@@ -62,8 +78,48 @@ impl SglangAdapter {
                 warmup_skip_from_env(),
                 WARMUP_TRIGGER_KEY,
             )),
+            drafter: Mutex::default(),
             metrics_off: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the server is configured with a drafter, `None` while that is
+    /// unknown. `/server_info` gathers every scheduler's internal state, so
+    /// it is asked once rather than every poll — again a minute after a
+    /// failed attempt — and the launch flags it reports do not change while
+    /// the server runs.
+    async fn drafter_configured(&self) -> Option<bool> {
+        let mut lookup = self.drafter.lock().await;
+        if lookup.configured.is_some() {
+            return lookup.configured;
+        }
+        if lookup
+            .last_attempt
+            .is_some_and(|at| at.elapsed() < DRAFTER_LOOKUP_RETRY)
+        {
+            return None;
+        }
+        lookup.last_attempt = Some(Instant::now());
+        let response = self.http.get("/server_info").send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let info = response.json::<serde_json::Value>().await.ok()?;
+        lookup.configured = drafter_in_server_info(&info);
+        lookup.configured
+    }
+}
+
+/// Whether `/server_info` names a speculative algorithm — `EAGLE`, `NEXTN`,
+/// `NGRAM`, … — or none (`null`). `None` when the answer carries no
+/// `speculative_algorithm` field at all.
+fn drafter_in_server_info(info: &serde_json::Value) -> Option<bool> {
+    match info.get("speculative_algorithm")? {
+        serde_json::Value::Null => Some(false),
+        serde_json::Value::String(name) => {
+            Some(!(name.is_empty() || name.eq_ignore_ascii_case("none")))
+        }
+        _ => None,
     }
 }
 
@@ -209,6 +265,7 @@ impl EngineAdapter for SglangAdapter {
             self.gen_rate.lock().await.observe(current_gen, now);
         let (prompt_tokens_per_sec, avg_prompt_tokens_per_sec) =
             self.prompt_rate.lock().await.observe(current_prompt, now);
+        let drafter = self.drafter_configured().await;
 
         Some(engine_metrics(
             parsed,
@@ -220,6 +277,7 @@ impl EngineAdapter for SglangAdapter {
                 avg_prompt_tokens_per_sec,
             },
             warming_up,
+            drafter,
         ))
     }
 }
@@ -262,12 +320,14 @@ fn metrics_off_signal(success: bool, code: u16) -> Option<bool> {
 /// else. `parsed` is the scrape after the warmup baseline is subtracted,
 /// `raw` the same scrape as read, for the lifetime figures that must not
 /// restart at the baseline. `warming_up` blanks the delta-derived fields
-/// exactly as the vLLM adapter blanks them.
+/// exactly as the vLLM adapter blanks them. `drafter` is whether the server
+/// is configured with one, `None` while unknown.
 fn engine_metrics(
     parsed: &ParsedMetrics,
     raw: &ParsedMetrics,
     rates: RateInputs,
     warming_up: bool,
+    drafter: Option<bool>,
 ) -> EngineMetrics {
     let counter = |name: &str| parsed.counters.get(name).copied();
 
@@ -365,6 +425,24 @@ fn engine_metrics(
     let spec_decode_mean_acceptance_length = acceptance.map(|(length, _)| (length - 1.0).max(0.0));
     let spec_decode_acceptance_rate = acceptance.and_then(|(_, rate)| rate).map(|v| v * 100.0);
 
+    // Draft rounds: SGLang counts each request's verify rounds and adds
+    // them to `spec_verify_calls_total` when the request finishes — vLLM's
+    // `num_drafts`, one per request per draft. The counter appears only once
+    // a request with a verified draft has finished, so a drafter that has not
+    // drafted yet shows nowhere in the scrape; for a server that says it
+    // runs one, that absence is a count of zero — the same "configured,
+    // nothing drafted yet" a vLLM drafter reports with its counters at zero.
+    // Read absolute, as vLLM's spec counters are.
+    let spec_decode_drafts_total = match (
+        raw.counters.get("sglang_spec_verify_calls_total").copied(),
+        drafter,
+    ) {
+        (_, Some(false)) => None,
+        (Some(rounds), _) => Some(rounds.max(0.0) as u64),
+        (None, Some(true)) => Some(0),
+        (None, None) => None,
+    };
+
     // Percentiles, goodput and shipped buckets from the request-level
     // histograms, through the same helpers as the vLLM adapter — SGLang's
     // buckets are plain cumulative histograms in seconds.
@@ -435,7 +513,7 @@ fn engine_metrics(
         tpot_buckets: None,
         spec_decode_draft_tokens_total: None,
         spec_decode_accepted_tokens_total: None,
-        spec_decode_drafts_total: None,
+        spec_decode_drafts_total,
         spec_decode_acceptance_rate,
         spec_decode_acceptance_rate_live: None,
         spec_decode_mean_acceptance_length,
@@ -467,7 +545,7 @@ mod tests {
     /// `engine_metrics` for a scrape no baseline has been subtracted from —
     /// one that is its own raw reading.
     fn map_unbaselined(parsed: &ParsedMetrics, rates: RateInputs, warming: bool) -> EngineMetrics {
-        engine_metrics(parsed, parsed, rates, warming)
+        engine_metrics(parsed, parsed, rates, warming, None)
     }
 
     #[test]
@@ -612,6 +690,7 @@ mod tests {
         assert!(m.tpot_buckets.is_none());
         assert_eq!(m.spec_decode_draft_tokens_total, None);
         assert_eq!(m.spec_decode_accepted_tokens_total, None);
+        // The fixture's capture trimmed `spec_verify_calls_total` away.
         assert_eq!(m.spec_decode_drafts_total, None);
         assert_eq!(m.spec_decode_acceptance_rate_live, None);
         // Rates are the adapter's stateful derivation; the pure mapping was
@@ -880,7 +959,10 @@ sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",role=\"decode\"} 4
 
         let polls = Arc::new(AtomicU64::new(0));
         let served = polls.clone();
-        let server = TestServer::start(move |_| {
+        let server = TestServer::start(move |r| {
+            if r.path != "/metrics" {
+                return (404, String::new());
+            }
             let n = served.fetch_add(1, Ordering::SeqCst);
             (200, growing_scrape(5 + n, 1000 + 100 * n))
         })
@@ -983,5 +1065,85 @@ sglang:spec_accept_rate{tp_rank=\"0\"} 0.0
         );
         assert_eq!(m.spec_decode_mean_acceptance_length, Some(0.0));
         assert_eq!(m.spec_decode_acceptance_rate, Some(0.0));
+    }
+
+    /// An SGLang drafter that has not verified a draft logs its acceptance
+    /// gauges as `0`, exactly like a server without one. `/server_info`
+    /// tells them apart: a configured drafter reports zero draft rounds —
+    /// "has drafted no tokens yet" — while a server without one reports no
+    /// speculative decoding at all.
+    #[test]
+    fn an_idle_drafter_reports_zero_draft_rounds_and_no_drafter_reports_none() {
+        let idle = parse_sglang(
+            "# TYPE sglang:spec_accept_length gauge\n\
+             sglang:spec_accept_length{tp_rank=\"0\"} 0.0\n\
+             # TYPE sglang:spec_accept_rate gauge\n\
+             sglang:spec_accept_rate{tp_rank=\"0\"} 0.0\n",
+        )
+        .expect("parses");
+        let rates = RateInputs::default();
+
+        let configured = engine_metrics(&idle, &idle, rates, false, Some(true));
+        assert_eq!(configured.spec_decode_drafts_total, Some(0));
+        assert_eq!(configured.spec_decode_acceptance_rate, None);
+        assert_eq!(configured.spec_decode_mean_acceptance_length, None);
+
+        let without = engine_metrics(&idle, &idle, rates, false, Some(false));
+        assert_eq!(without.spec_decode_drafts_total, None);
+
+        let unknown = engine_metrics(&idle, &idle, rates, false, None);
+        assert_eq!(unknown.spec_decode_drafts_total, None);
+
+        // Once requests with verified drafts finish, the counter speaks for
+        // itself, with or without `/server_info`.
+        let drafted = parse_sglang(
+            "# TYPE sglang:spec_verify_calls counter\n\
+             sglang:spec_verify_calls_total{model_name=\"m\"} 42.0\n",
+        )
+        .expect("parses");
+        let m = engine_metrics(&drafted, &drafted, rates, false, None);
+        assert_eq!(m.spec_decode_drafts_total, Some(42));
+    }
+
+    #[test]
+    fn server_info_names_the_speculative_algorithm_or_none() {
+        use serde_json::json;
+        let drafter = |info| drafter_in_server_info(&info);
+        assert_eq!(
+            drafter(json!({"speculative_algorithm": "EAGLE"})),
+            Some(true)
+        );
+        assert_eq!(drafter(json!({"speculative_algorithm": null})), Some(false));
+        assert_eq!(
+            drafter(json!({"speculative_algorithm": "NONE"})),
+            Some(false)
+        );
+        assert_eq!(drafter(json!({"model_path": "m"})), None);
+    }
+
+    /// The adapter asks `/server_info` once, not every poll: the route
+    /// gathers every scheduler's state.
+    #[tokio::test]
+    async fn the_drafter_is_looked_up_once() {
+        use super::super::test_server::TestServer;
+        let server = TestServer::start(|r| match r.path.as_str() {
+            "/server_info" => (200, r#"{"speculative_algorithm":"EAGLE"}"#.into()),
+            _ => (
+                200,
+                "# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs 0.0\n".into(),
+            ),
+        })
+        .await;
+        let adapter = SglangAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+        for _ in 0..3 {
+            let m = adapter.get_metrics().await.expect("metrics");
+            assert_eq!(m.spec_decode_drafts_total, Some(0));
+        }
+        let lookups = server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/server_info")
+            .count();
+        assert_eq!(lookups, 1);
     }
 }
