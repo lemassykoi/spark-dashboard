@@ -217,7 +217,9 @@ impl EngineAdapter for SglangAdapter {
         // runs a one-token generation through the scheduler, so it stalls for
         // as long as the queue ahead of it — a live but busy engine would
         // read as failing health under exactly the load that matters.
-        self.http.health("/ready").await
+        // `/ready` arrived in v0.5.20; before it, `/model_info` — also
+        // answered by the tokenizer manager, never the scheduler — stands in.
+        self.http.health_or("/ready", "/model_info").await
     }
 
     async fn get_model_info(&self) -> ModelResolution {
@@ -1044,6 +1046,49 @@ sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",role=\"decode\"} 4
             logged.contains("configure a provider API key"),
             "warning logged: {logged}"
         );
+    }
+
+    /// A release without `/ready` is healthy while `/model_info` answers; a
+    /// 401 there is reported as such, and `/ready`, where it exists, wins.
+    #[tokio::test]
+    async fn health_falls_back_to_model_info_where_ready_is_missing() {
+        use super::super::test_server::TestServer;
+        for (ready, model_info, expected) in [
+            (200, 404, EngineStatus::Running),
+            (
+                503,
+                200,
+                EngineStatus::Error("HTTP 503 Service Unavailable".into()),
+            ),
+            (404, 200, EngineStatus::Running),
+            (
+                404,
+                401,
+                EngineStatus::Error("HTTP 401 Unauthorized".into()),
+            ),
+            (404, 404, EngineStatus::Error("HTTP 404 Not Found".into())),
+        ] {
+            let server = TestServer::start(move |r| match r.path.as_str() {
+                "/ready" => (ready, String::new()),
+                _ => (model_info, String::new()),
+            })
+            .await;
+            let adapter = SglangAdapter::new(
+                reqwest::Client::new(),
+                server.url.clone(),
+                None,
+                Some("k".into()),
+            );
+            assert_eq!(
+                adapter.health_check().await,
+                expected,
+                "/ready {ready}, /model_info {model_info}"
+            );
+            assert!(server
+                .requests()
+                .iter()
+                .all(|r| r.path != "/health" && r.path != "/server_info"));
+        }
     }
 
     /// SGLang's accept length counts the token the target model emits every

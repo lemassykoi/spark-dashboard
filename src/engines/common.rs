@@ -59,7 +59,20 @@ impl EngineHttp {
 
     /// Running when `path` answers 2xx; otherwise the status or the error.
     pub(crate) async fn health(&self, path: &str) -> EngineStatus {
+        Self::status_of(self.get(path).send().await)
+    }
+
+    /// Like [`health`](Self::health), but a 404 from `path` — a route this
+    /// release of the engine predates — is answered by `fallback` instead.
+    pub(crate) async fn health_or(&self, path: &str, fallback: &str) -> EngineStatus {
         match self.get(path).send().await {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => self.health(fallback).await,
+            result => Self::status_of(result),
+        }
+    }
+
+    fn status_of(result: reqwest::Result<reqwest::Response>) -> EngineStatus {
+        match result {
             Ok(r) if r.status().is_success() => EngineStatus::Running,
             Ok(r) => EngineStatus::Error(format!("HTTP {}", r.status())),
             Err(e) => EngineStatus::Error(e.to_string()),

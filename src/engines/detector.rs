@@ -849,24 +849,30 @@ async fn probe_engine(http: &EngineHttp, engine_type: &EngineType) -> bool {
             .is_some_and(|r| r.status().is_success()),
         EngineType::Sglang => {
             // SGLang answers Ollama-compatible routes too, so "a route
-            // exists" proves little — but `/ready` and `/model_info` are
-            // SGLang's own: vLLM serves neither. Both are answered by the
-            // tokenizer manager without a round trip through the scheduler,
-            // so probing every detection tick costs the engine nothing —
-            // unlike `/server_info`, which collects every scheduler's
-            // internal state, or `/health`, which runs a generation.
-            // `/ready` must say ready; `/model_info` must exist — a 200, or
-            // a 401 when the engine has an API key the dashboard lacks (the
-            // route is there); only a 404 says this is not SGLang.
-            if !answers("/ready")
-                .await
-                .is_some_and(|r| r.status().is_success())
-            {
-                return false;
+            // exists" proves little — but `/model_info` is SGLang's own
+            // (vLLM serves no such route), and so is `/ready` (vLLM's only
+            // `/ready` is the data-parallel supervisor's, which has no
+            // `/model_info`). Both are answered by the tokenizer manager
+            // without a round trip through the scheduler, so probing every
+            // detection tick costs the engine nothing — unlike
+            // `/server_info`, which collects every scheduler's internal
+            // state, or `/health`, which runs a generation.
+            // `/ready` only exists from v0.5.20; a release without it (404)
+            // is identified by `/model_info` answering 200 alone. Where
+            // `/ready` exists it must say ready, and `/model_info` must
+            // exist — a 200, or a 401 when the engine has an API key the
+            // dashboard lacks (the route is there); only a 404 says this is
+            // not SGLang.
+            let model_info = || async { answers("/model_info").await.map(|r| r.status()) };
+            match answers("/ready").await.map(|r| r.status()) {
+                Some(ready) if ready.is_success() => model_info()
+                    .await
+                    .is_some_and(|s| s != reqwest::StatusCode::NOT_FOUND),
+                Some(reqwest::StatusCode::NOT_FOUND) => {
+                    model_info().await.is_some_and(|s| s.is_success())
+                }
+                _ => false,
             }
-            answers("/model_info")
-                .await
-                .is_some_and(|r| r.status() != reqwest::StatusCode::NOT_FOUND)
         }
     }
 }
@@ -919,6 +925,61 @@ mod tests {
                 is_sglang,
                 "/model_info answering {model_info}"
             );
+        }
+    }
+
+    /// A release without `/ready` (it arrived in v0.5.20) is still SGLang
+    /// when `/model_info` answers 200 — and only then: a 401 there could be
+    /// any server's auth wall, and a server serving neither route is not
+    /// SGLang. A `/ready` that exists but is not ready (503) is a starting
+    /// engine, not a fallback case.
+    #[tokio::test]
+    async fn the_sglang_probe_falls_back_to_model_info_without_ready() {
+        use super::super::test_server::TestServer;
+        for (ready, model_info, is_sglang) in [
+            (404, 200, true),
+            (404, 401, false),
+            (404, 404, false),
+            (503, 200, false),
+        ] {
+            let server = TestServer::start(move |r| match r.path.as_str() {
+                "/ready" => (ready, String::new()),
+                _ => (model_info, String::new()),
+            })
+            .await;
+            let http =
+                EngineHttp::new(reqwest::Client::new(), server.url.clone(), Some("k".into()));
+            assert_eq!(
+                probe_engine(&http, &EngineType::Sglang).await,
+                is_sglang,
+                "/ready {ready}, /model_info {model_info}"
+            );
+            assert!(server
+                .requests()
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some("Bearer k")));
+        }
+    }
+
+    /// A vLLM-shaped server — `/health` and `/v1/models`, no SGLang route —
+    /// is not SGLang, whether or not it has a `/ready` (the data-parallel
+    /// supervisor's).
+    #[tokio::test]
+    async fn a_vllm_shaped_server_is_not_identified_as_sglang() {
+        use super::super::test_server::TestServer;
+        for ready in [404, 200] {
+            let server = TestServer::start(move |r| match r.path.as_str() {
+                "/health" | "/v1/models" => (200, String::new()),
+                "/ready" => (ready, String::new()),
+                _ => (404, String::new()),
+            })
+            .await;
+            let http = EngineHttp::new(reqwest::Client::new(), server.url.clone(), None);
+            assert!(
+                !probe_engine(&http, &EngineType::Sglang).await,
+                "/ready {ready}"
+            );
+            assert!(probe_engine(&http, &EngineType::Vllm).await);
         }
     }
 
