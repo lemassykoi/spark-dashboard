@@ -53,11 +53,11 @@ pub struct SglangAdapter {
     warmup: Mutex<WarmupTracker>,
     hf_model_cache: Mutex<Option<ModelInfo>>,
     last_hf_error: Mutex<Option<Instant>>,
-    /// Latched by each metrics scrape: true when `/metrics` answered but
-    /// carried no `sglang` series (the un-instrumented launch), false when
-    /// real series were seen. A scrape that could not reach the server at all
-    /// leaves the flag untouched — an unreachable engine is "offline", not
-    /// "metrics off".
+    /// Latched by each metrics scrape: true when `/metrics` answered 404 (the
+    /// launch without `--enable-metrics`, which never mounts the route),
+    /// false when it answered at all. A scrape that could not reach the
+    /// server, or met a transient error, leaves the flag untouched — an
+    /// unreachable engine is "offline", not "metrics off".
     metrics_off: AtomicBool,
 }
 
@@ -112,9 +112,15 @@ fn parse_sglang(body: &str) -> Option<ParsedMetrics> {
     Some(parsed)
 }
 
-/// Whether a parsed scrape carries any sample at all.
-fn has_samples(parsed: &ParsedMetrics) -> bool {
-    !(parsed.counters.is_empty() && parsed.gauges.is_empty() && parsed.histograms.is_empty())
+/// Whether a parsed scrape carries any SGLang series. A server started with
+/// `--enable-metrics` whose collectors have not logged yet answers with none
+/// — nothing has been written to its multiprocess registry — and any other
+/// sample (a process collector, a proxy's own metrics) is not the engine's.
+fn has_sglang_series(parsed: &ParsedMetrics) -> bool {
+    let sglang = |name: &String| name.starts_with("sglang_");
+    parsed.counters.keys().any(sglang)
+        || parsed.gauges.keys().any(sglang)
+        || parsed.histograms.keys().any(sglang)
 }
 
 /// SGLang's acceptance gauges, combined across the ranks that report them.
@@ -278,17 +284,16 @@ impl EngineAdapter for SglangAdapter {
         // a scrape can answer are testable without a server. A failure to
         // reach the server never gets here — the `send()` above stops it —
         // because offline is not the same as off.
-        let parsed = status
+        if let Some(off) = metrics_off_signal(status.is_success(), status.as_u16()) {
+            self.metrics_off.store(off, Ordering::Relaxed);
+        }
+        // Metrics on but no SGLang series yet is "no data yet": the engine
+        // reports nothing this tick, and its panels say it has no metrics yet.
+        let raw = status
             .is_success()
             .then(|| parse_sglang(&body))
             .flatten()
-            .filter(has_samples);
-        if let Some(off) =
-            metrics_off_signal(status.is_success(), status.as_u16(), parsed.is_some())
-        {
-            self.metrics_off.store(off, Ordering::Relaxed);
-        }
-        let raw = parsed?;
+            .filter(has_sglang_series)?;
         let warmup_out = {
             let mut tracker = self.warmup.lock().await;
             tracker.observe(&raw)
@@ -404,18 +409,22 @@ struct RateInputs {
 
 /// The metrics-off latch decision for one *answered* scrape.
 ///
-/// - answered OK with SGLang series: metrics are on (`Some(false)`);
-/// - answered OK without any: nothing to scrape — off (`Some(true)`);
-/// - 404: the unflagged launch does not mount the route at all (verified
-///   against the v0.5.21 source in review) — off (`Some(true)`);
+/// SGLang mounts `/metrics` only when launched with `--enable-metrics`
+/// (`add_prometheus_middleware` in `http_server.py`), and its API-key
+/// middleware always lets `/metrics` through, so the route's existence is
+/// the signal:
+///
+/// - answered OK: the route is mounted, metrics are on (`Some(false)`) —
+///   whether or not any series has been logged yet;
+/// - 404: the launch without the flag, which never mounts the route — off
+///   (`Some(true)`);
 /// - any other answered failure: transient, and a transient is not "off" —
 ///   `None` leaves the previous reading alone.
-fn metrics_off_signal(success: bool, code: u16, has_series: bool) -> Option<bool> {
-    match (success, code, has_series) {
-        (true, _, true) => Some(false),
-        (true, _, false) => Some(true),
-        (false, 404, _) => Some(true),
-        (false, _, _) => None,
+fn metrics_off_signal(success: bool, code: u16) -> Option<bool> {
+    match (success, code) {
+        (true, _) => Some(false),
+        (false, 404) => Some(true),
+        (false, _) => None,
     }
 }
 
@@ -821,23 +830,85 @@ mod tests {
 
     #[test]
     fn metrics_off_latches_from_the_answer_and_only_the_answer() {
-        // The three ways a scrape answers, plus the one that must not latch:
+        // The two answers that decide, plus the ones that must not latch:
         // a transient failure keeps the previous reading.
-        assert_eq!(metrics_off_signal(true, 200, true), Some(false));
-        assert_eq!(metrics_off_signal(true, 200, false), Some(true));
-        assert_eq!(metrics_off_signal(false, 404, false), Some(true));
-        assert_eq!(metrics_off_signal(false, 404, true), Some(true));
-        assert_eq!(metrics_off_signal(false, 429, false), None);
-        assert_eq!(metrics_off_signal(false, 500, false), None);
+        assert_eq!(metrics_off_signal(true, 200), Some(false));
+        assert_eq!(metrics_off_signal(false, 404), Some(true));
+        assert_eq!(metrics_off_signal(false, 429), None);
+        assert_eq!(metrics_off_signal(false, 500), None);
     }
 
+    /// Only a 404 says metrics are off. A server launched with
+    /// `--enable-metrics` whose collectors have not logged yet answers 200
+    /// with no SGLang series — that is "no data yet", and telling its
+    /// operator to relaunch with a flag they already passed would be wrong.
+    #[tokio::test]
+    async fn only_a_missing_route_latches_metrics_off() {
+        use super::super::test_server::TestServer;
+
+        let cases: [(u16, &str, bool, bool); 4] = [
+            // status, body, metrics off afterwards, metrics reported
+            (404, "Not Found", true, false),
+            (200, "", false, false),
+            (
+                200,
+                "# TYPE python_gc_objects_collected counter\npython_gc_objects_collected_total 7\n",
+                false,
+                false,
+            ),
+            (
+                200,
+                "# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs 2.0\n",
+                false,
+                true,
+            ),
+        ];
+        for (status, body, off, reported) in cases {
+            let server = TestServer::start(move |_| (status, body.to_string())).await;
+            let adapter =
+                SglangAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+            let metrics = adapter.get_metrics().await;
+            assert_eq!(adapter.metrics_off(), off, "{status} {body:?}");
+            assert_eq!(metrics.is_some(), reported, "{status} {body:?}");
+        }
+    }
+
+    /// A latched "off" clears as soon as the route answers — the operator
+    /// relaunched with the flag — even before the first series is logged.
+    #[tokio::test]
+    async fn metrics_off_clears_once_the_route_answers() {
+        use super::super::test_server::TestServer;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let relaunched = Arc::new(AtomicBool::new(false));
+        let flag = relaunched.clone();
+        let server = TestServer::start(move |_| {
+            if flag.load(Ordering::SeqCst) {
+                (200, String::new())
+            } else {
+                (404, "Not Found".into())
+            }
+        })
+        .await;
+        let adapter = SglangAdapter::new(reqwest::Client::new(), server.url.clone(), None, None);
+        assert!(adapter.get_metrics().await.is_none());
+        assert!(adapter.metrics_off());
+
+        relaunched.store(true, Ordering::SeqCst);
+        assert!(adapter.get_metrics().await.is_none(), "no series yet");
+        assert!(!adapter.metrics_off());
+    }
+
+    /// Only `sglang:` series count as the engine's: a comment-only body, or
+    /// one holding some other exporter's samples, has nothing to report.
     #[test]
-    fn an_exposition_without_samples_has_none() {
-        // The metrics-off decision rests on this: a body that carries no
-        // sample at all (or a 404 body) holds nothing to report.
+    fn only_sglang_series_count_as_the_engines() {
         let comment_only = parse_sglang("# only a comment\n").expect("parses");
-        assert!(!has_samples(&comment_only));
-        assert!(parse_sglang("").is_none_or(|p| !has_samples(&p)));
+        assert!(!has_sglang_series(&comment_only));
+        let foreign = parse_sglang("process_open_fds 12\n").expect("parses");
+        assert!(!has_sglang_series(&foreign));
+        assert!(has_sglang_series(&parsed_real()));
     }
 
     /// With `--dp-size 2` each rank logs its own scheduler gauges. The engine
