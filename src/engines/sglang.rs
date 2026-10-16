@@ -277,8 +277,17 @@ impl EngineAdapter for SglangAdapter {
         let current_gen = counter("sglang_generation_tokens_total");
         let current_prompt = counter("sglang_prompt_tokens_total");
         let now = Instant::now();
-        let (tokens_per_sec, avg_tokens_per_sec) =
+        // SGLang's `generation_tokens_total` counter only advances at request
+        // completion, so a delta between polls reads 0 for the whole of an
+        // in-flight request and spikes once at the end. `gen_throughput` is the
+        // scheduler's live decode-rate gauge — one series per data-parallel
+        // rank (attention-TP rank 0), summed to the engine, exactly like
+        // `num_running_reqs` — so it is the honest live tokens/sec. The counter
+        // delta stays as the fallback for a release that has no such gauge.
+        let live_decode = parsed.gauge_sum("sglang_gen_throughput");
+        let (gen_delta_tps, avg_tokens_per_sec) =
             self.gen_rate.lock().await.observe(current_gen, now);
+        let tokens_per_sec = live_decode_tps(live_decode, gen_delta_tps);
         let (prompt_tokens_per_sec, avg_prompt_tokens_per_sec) =
             self.prompt_rate.lock().await.observe(current_prompt, now);
         let drafter = self.drafter_configured().await;
@@ -307,6 +316,15 @@ struct RateInputs {
     prompt_tokens_per_sec: Option<f64>,
     avg_tokens_per_sec: Option<f64>,
     avg_prompt_tokens_per_sec: Option<f64>,
+}
+
+/// The live decode rate. SGLang's `gen_throughput` gauge is the scheduler's
+/// real-time tokens/sec; the `generation_tokens_total` counter only advances at
+/// request completion, so a delta between polls reads 0 for the whole of an
+/// in-flight request and spikes once at the end. Prefer the gauge; fall back to
+/// the counter delta for a release that exposes no such gauge.
+fn live_decode_tps(gauge: Option<f64>, counter_delta: Option<f64>) -> Option<f64> {
+    gauge.or(counter_delta)
 }
 
 /// The metrics-off latch decision for one *answered* scrape.
@@ -734,6 +752,18 @@ mod tests {
         assert_eq!(m.active_requests, Some(4));
         assert_eq!(m.spec_decode_acceptance_rate, None);
         assert_eq!(m.spec_decode_mean_acceptance_length, None);
+    }
+
+    #[test]
+    fn live_decode_prefers_the_gauge_over_the_completion_ticked_delta() {
+        // Mid-request the counter delta is 0 while the gauge is live: the gauge
+        // wins, so the panel ticks during generation instead of reading 0.
+        assert_eq!(live_decode_tps(Some(30.0), Some(0.0)), Some(30.0));
+        assert_eq!(live_decode_tps(Some(30.0), None), Some(30.0));
+        // A release with no `gen_throughput` gauge falls back to the delta.
+        assert_eq!(live_decode_tps(None, Some(12.0)), Some(12.0));
+        // Neither present: nothing to report.
+        assert_eq!(live_decode_tps(None, None), None);
     }
 
     #[test]
