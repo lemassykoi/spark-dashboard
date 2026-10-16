@@ -131,6 +131,81 @@ impl CounterRate {
     }
 }
 
+/// The running mean of a gauge that is already a rate and reads 0 while idle —
+/// SGLang's `gen_throughput`, say. This is the gauge counterpart of
+/// `CounterRate`'s mean, for a source that is *not* a counter: feeding such a
+/// gauge through `CounterRate` would differentiate it (rate-of-a-rate), and
+/// deriving the rate from a completion-ticked counter instead makes the mean a
+/// per-request token count, not a throughput. Only positive samples count, so
+/// the mean holds steady while the engine idles.
+#[derive(Debug, Default)]
+pub(crate) struct GaugeMean {
+    accum: (f64, u64),
+}
+
+impl GaugeMean {
+    /// Feed one reading; returns the running mean of the positive readings seen
+    /// so far, or `None` until one has been positive.
+    pub(crate) fn observe(&mut self, value: Option<f64>) -> Option<f64> {
+        if let Some(v) = value {
+            if v > 0.0 {
+                self.accum.0 += v;
+                self.accum.1 += 1;
+            }
+        }
+        (self.accum.1 > 0).then(|| self.accum.0 / self.accum.1 as f64)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Token acceptance rate (TAR) as a percentage: `accepted / draft * 100`.
+///
+/// Returns `None` unless both counts are present, `draft > 0`, and `accepted`
+/// is non-negative, so the tile stays blank until at least one token has been
+/// drafted and never surfaces a negative rate from a malformed/reset counter.
+/// Used for both the lifetime TAR (absolute counters) and the live TAR
+/// (per-poll deltas).
+pub(crate) fn spec_acceptance_rate(accepted: Option<f64>, draft: Option<f64>) -> Option<f64> {
+    match (accepted, draft) {
+        (Some(a), Some(d)) if d > 0.0 && a >= 0.0 => Some((a / d) * 100.0),
+        _ => None,
+    }
+}
+
+/// Mean acceptance length: accepted tokens per draft attempt (`accepted / drafts`).
+///
+/// Returns `None` unless both counts are present and `drafts > 0`.
+pub(crate) fn spec_mean_acceptance_length(
+    accepted: Option<f64>,
+    drafts: Option<f64>,
+) -> Option<f64> {
+    match (accepted, drafts) {
+        (Some(a), Some(n)) if n > 0.0 => Some(a / n),
+        _ => None,
+    }
+}
+
+/// The live (windowed) token acceptance rate between two readings of the
+/// `(accepted, draft)` counters: Δaccepted / Δdraft * 100. `None` on the
+/// first reading or when either is missing, when a counter went backwards —
+/// the engine restarted and reset its counters, and diffing against the
+/// stale reading would inflate or negate the rate — and when nothing was
+/// drafted in between. The caller keeps `now` as the next `prev`.
+pub(crate) fn spec_live_acceptance_rate(
+    prev: Option<(f64, f64)>,
+    now: Option<(f64, f64)>,
+) -> Option<f64> {
+    let ((prev_acc, prev_draft), (acc, draft)) = (prev?, now?);
+    if acc >= prev_acc && draft >= prev_draft {
+        spec_acceptance_rate(Some(acc - prev_acc), Some(draft - prev_draft))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +234,19 @@ mod tests {
             rate.observe(Some(5.0), t0 + Duration::from_secs(5)),
             (None, None)
         );
+    }
+
+    #[test]
+    fn gauge_mean_averages_positive_samples_and_holds_while_idle() {
+        let mut mean = GaugeMean::default();
+        assert_eq!(mean.observe(None), None);
+        assert_eq!(mean.observe(Some(0.0)), None, "idle reads are not samples");
+        assert_eq!(mean.observe(Some(30.0)), Some(30.0));
+        assert_eq!(mean.observe(Some(40.0)), Some(35.0));
+        // An idle poll leaves the mean where it was, rather than dragging it to
+        // the average of active and idle.
+        assert_eq!(mean.observe(Some(0.0)), Some(35.0));
+        mean.reset();
+        assert_eq!(mean.observe(Some(10.0)), Some(10.0));
     }
 }
